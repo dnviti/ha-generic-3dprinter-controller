@@ -1,0 +1,18 @@
+round	decision	why	evidence	result
+1	Use HA core as the citation anchor	for moonraker/octoprint/prusalink/bambu_lab	api.github.com/repos/home-assistant/core default_branch=dev	confirmed dev is the branch
+2	Moonraker is NOT in HA core	raw fetches of components/moonraker + moonraker/api.py + coordinator.py returned 404; api.github.com contents 404	switched to HACS repo marcolivierarsenault/moonraker-home-assistant
+3	OctoPrint/PrusaLink HTTP lives in pip libs, not the component	fetched coordinator.py: imports pyoctoprintapi; imports pyprusalink	fetched rfleming71/pyoctoprintapi and home-assistant-libs/pyprusalink
+4	Quote endpoint strings from the lib, not the HA component	HA component contains no URL literals	/api/printer, /api/job, /api/files, /api/v1/status, /api/v1/job all read from lib source
+5	Bambu: use greghesp/ha-bambulab pybambu for transport, not memory	wanted real port/topic/credential	saw port=8883, username_pw_set("bblp", password=access_code), device/<serial>/report and /request
+6	Delegated Duet, Bambu docs, Anycubic+Creality to subagents	context budget; those are doc/community-heavy, not HA-core	3 background subagents started
+7	Could not resolve HA core bambu_lab path	contents + manifest.json + raw file all 404 on dev	mark HA-core bambu path UNCONFIRMED; cite HACS repo instead
+8	Duet docs are JS-rendered	docs.duet3d.com/Gcodes returned only a title	rely on subagent's DuetWebControl source reading; mark doc-only claims UNCONFIRMED
+9	Anycubic research delegated rather than guessed	no HA-core integration exists; only cloud RE found in search so far	wait for subagent, expect honest gaps
+10	Read Moonraker upload route from source after doc page truncated	file_manager.py had no register for /server/files/upload	grep of application.py showed register_upload_handler("/server/files/upload") and form fields root/print/path/checksum
+11	Rewrote section 4 after Bambu subagent corrected three premises	it proved camera ports are inverted, HA core has no bambu_lab, and writes are ACS-gated	fetched bambu_client.py and const.py myself to confirm port 8883, bblp, topics, and the fun bit
+12	Rewrote sections 7 and 8 after Anycubic/Creality subagent corrected two premises	no local REST on Kobra and no Moonraker on K1	accepted the MQTT 9883 handshake and the port-9999 WebSocket findings with their citations
+13	Rewrote section 5 after Duet subagent read RRF/DSF source	docs.duet3d.com is JS-rendered and gave me nothing	standalone polls, SBC pushes; rr_status and rr_config are compiled out
+14	Folded Bambu addendum: write gate blocks all control	coordinator.py refuses every write when the fun bit is set	section 4 now leads with the gate and the conflicting firmware thresholds
+15	Folded Duet addendum: closed two gaps	RepRap.cpp confirmed the rr_model envelope; media/pyprusalink upload claims checked	marked M409 envelope confirmed, added the G91-vs-M83 extrusion trap
+16	Downgraded 3 matrix cells I had overclaimed	judged against what I actually fetched	OctoPrint and PrusaLink default ports to UNCONFIRMED; PrusaLink upload to UNCONFIRMED
+17	Verified the report as an artifact	Prove It Works: measured, did not assert	856 lines, 12 h2 sections, 134 unique URLs, 47 UNCONFIRMED markers
