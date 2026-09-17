@@ -1,0 +1,854 @@
+"""Elegoo SDCP adapter, for the Centauri Carbon and its siblings.
+
+SDCP is a JSON protocol over a WebSocket on port 3030. A request carries a command
+number inside a fixed envelope, and the printer answers on a topic string derived
+from its own mainboard id rather than on a numeric topic id.
+
+Verified by this project against a live Centauri Carbon on firmware V1.4.49:
+commands 0, 1, 258 and 320 answered, status and attribute frames arrived
+continuously, and the camera streamed multipart JPEG from port 3031.
+
+The safety rule this adapter exists to respect. An unrecognised SDCP command code,
+or a recognised code sent with an unexpected payload shape, can crash the
+printer's ``app`` daemon. On this hardware ``app`` is the whole host firmware
+including the motion stack, so a crash destroys an active print and needs a power
+cycle at the wall. Only the codes in :data:`COMMAND` are ever sent, and start print
+is additionally withheld behind the registry's opt-in because this adapter builds
+that payload itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
+from types import MappingProxyType
+from typing import Any, Final
+
+import aiohttp
+
+from ..const import (
+    Capability,
+    Command,
+    LightChannel,
+    PrintState,
+    ProtocolId,
+    UnsafeFeature,
+)
+from ..models import (
+    Axis,
+    Celsius,
+    Fans,
+    FileEntry,
+    Millimetres,
+    Percent,
+    PrinterSnapshot,
+    Seconds,
+    Temps,
+)
+from ..protocols import (
+    CommandRejectedError,
+    PrinterConfig,
+    Protocol,
+    ProtocolError,
+    UnreachableError,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+WS_PATH: Final = "/websocket"
+DEFAULT_WS_PORT: Final = 3030
+DEFAULT_CAMERA_PORT: Final = 3031
+CAMERA_PATH: Final = "/video"
+UPLOAD_PATH: Final = "/uploadFile/upload"
+
+UPLOAD_CHUNK: Final = 1024 * 1024
+JPEG_SOI: Final = b"\xff\xd8"
+JPEG_EOI: Final = b"\xff\xd9"
+MAX_FRAME_BYTES: Final = 8 * 1024 * 1024
+STREAM_CHUNK: Final = 65536
+
+#: How long to wait for the acknowledgement frame of a command.
+ACK_TIMEOUT: Final = 10.0
+
+#: How long to wait for a pushed payload after an acknowledgement. The printer
+#: sends the file list and the attributes in a frame of their own, after the ack.
+PUSH_TIMEOUT: Final = 5.0
+
+#: The only command codes this adapter will ever put on the wire.
+COMMAND: Final[Mapping[str, int]] = MappingProxyType(
+    {
+        "status": 0,
+        "attributes": 1,
+        "start_print": 128,
+        "pause": 129,
+        "stop": 130,
+        "resume": 131,
+        "file_list": 258,
+        "delete_files": 259,
+        "history": 320,
+        "set_params": 403,
+    }
+)
+
+#: ``PrintInfo.Status`` is a code table, not a bit field. Values 2 to 4 and 23 to
+#: 26 are resin-only and are mapped to a neutral state rather than to a guess.
+STATE_BY_PRINT_STATUS: Final[Mapping[int, PrintState]] = MappingProxyType(
+    {
+        0: PrintState.IDLE,
+        1: PrintState.PREPARING,
+        5: PrintState.PAUSED,
+        6: PrintState.PAUSED,
+        7: PrintState.CANCELLED,
+        8: PrintState.CANCELLED,
+        9: PrintState.FINISHED,
+        10: PrintState.PREPARING,
+        11: PrintState.PREPARING,
+        12: PrintState.PRINTING,
+        13: PrintState.PRINTING,
+        14: PrintState.ERROR,
+        15: PrintState.PREPARING,
+        16: PrintState.PREPARING,
+        17: PrintState.PREPARING,
+        18: PrintState.PREPARING,
+    }
+)
+
+ACK_MESSAGES: Final[Mapping[int, str]] = MappingProxyType(
+    {
+        1: "the printer is busy",
+        2: "the file was not found",
+        3: "the command was rejected",
+    }
+)
+
+#: The three temperature fields of the overloaded 403 command. The command code is
+#: shared but the payload key selects the heater, so the choice stays one layer
+#: down and the normalised vocabulary remains a statement about printers.
+SET_HOTEND_FIELD: Final = "TempTargetNozzle"
+SET_BED_FIELD: Final = "TempTargetHotbed"
+SET_CHAMBER_FIELD: Final = "TempTargetBox"
+
+_FAN_KEYS: Final[Mapping[str, str]] = MappingProxyType(
+    {"model": "ModelFan", "auxiliary": "AuxiliaryFan", "chamber": "BoxFan"}
+)
+
+
+# --------------------------------------------------------------------- parsing
+
+
+def build_frame(
+    mainboard_id: str, cmd: int, data: Mapping[str, Any] | None = None
+) -> tuple[str, str]:
+    """Return ``(request_id, frame)`` for one SDCP request.
+
+    ``From`` is 1, matching Elegoo's own SDK. The printer tolerates an empty ``Id``
+    and no ``Topic`` on a request, which is what this integration sends.
+    """
+    request_id = uuid.uuid4().hex
+    frame = json.dumps(
+        {
+            "Id": "",
+            "Data": {
+                "Cmd": cmd,
+                "Data": dict(data or {}),
+                "RequestID": request_id,
+                "MainboardID": mainboard_id,
+                "TimeStamp": int(time.time() * 1000),
+                "From": 1,
+            },
+        }
+    )
+    return request_id, frame
+
+
+def load_frame(raw: str) -> Mapping[str, Any] | None:
+    """Decode one frame, tolerating the decimal length prefix some firmware adds."""
+    text = raw.lstrip()
+    if text[:1].isdigit():
+        brace = text.find("{")
+        if brace > 0:
+            text = text[brace:]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        _LOGGER.debug("ignoring an undecodable SDCP frame: %s", raw[:200])
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _integer(value: Any) -> int | None:
+    number = _number(value)
+    return int(number) if number is not None else None
+
+
+def status_flags(value: Any) -> tuple[int, ...]:
+    """Return ``CurrentStatus`` as a tuple, tolerating both a list and a scalar.
+
+    The printer's own web UI reads this array, where 1 means a job is active, so it
+    is kept as the cross-check for print states the code table does not cover.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            item for item in (_integer(entry) for entry in value) if item is not None
+        )
+    single = _integer(value)
+    return (single,) if single is not None else ()
+
+
+def parse_coord(value: Any) -> Axis | None:
+    """Parse the printer's ``"x,y,z"`` string. The field name is misspelled upstream."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(",")
+    if len(parts) != 3:
+        return None
+    numbers = [_number(part) for part in parts]
+    if any(number is None for number in numbers):
+        return None
+    return Axis(
+        x=Millimetres(numbers[0]),  # type: ignore[arg-type]
+        y=Millimetres(numbers[1]),  # type: ignore[arg-type]
+        z=Millimetres(numbers[2]),  # type: ignore[arg-type]
+    )
+
+
+def state_for(print_status: int | None, flags: tuple[int, ...]) -> PrintState:
+    """Return the normalised print state for one status object."""
+    if print_status is not None and print_status in STATE_BY_PRINT_STATUS:
+        return STATE_BY_PRINT_STATUS[print_status]
+    if 1 in flags:
+        return PrintState.PRINTING
+    if print_status == 0:
+        return PrintState.IDLE
+    return PrintState.UNKNOWN
+
+
+def parse_status(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the normalised scalar view of one SDCP status object.
+
+    A pure function of the payload, so the mapping can be tested without a socket.
+    """
+    print_info = status.get("PrintInfo") or {}
+    fans = status.get("CurrentFanSpeed") or {}
+    lights = status.get("LightStatus") or {}
+
+    return {
+        "print_status": _integer(print_info.get("Status")),
+        "current_layer": _integer(print_info.get("CurrentLayer")),
+        "total_layers": _integer(print_info.get("TotalLayer")),
+        "progress": _number(print_info.get("Progress")),
+        "filename": print_info.get("Filename") or None,
+        "job_id": print_info.get("TaskId") or None,
+        "speed_factor": _number(print_info.get("PrintSpeedPct")),
+        "hotend_current": _number(status.get("TempOfNozzle")),
+        "hotend_target": _number(status.get("TempTargetNozzle")),
+        "bed_current": _number(status.get("TempOfHotbed")),
+        "bed_target": _number(status.get("TempTargetHotbed")),
+        "chamber_current": _number(status.get("TempOfBox")),
+        "chamber_target": _number(status.get("TempTargetBox")),
+        "fan_model": _number(fans.get("ModelFan")),
+        "fan_auxiliary": _number(fans.get("AuxiliaryFan")),
+        "fan_chamber": _number(fans.get("BoxFan")),
+        "elapsed": _number(print_info.get("CurrentTicks")),
+        "total_ticks": _number(print_info.get("TotalTicks")),
+        "chamber_light": _integer(lights.get("SecondLight")),
+        "position": parse_coord(status.get("CurrenCoord")),
+        "current_status": status_flags(status.get("CurrentStatus")),
+    }
+
+
+def parse_file_list(payload: Any) -> list[FileEntry]:
+    """Normalise the ``FileList`` array into :class:`FileEntry` values."""
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
+        return []
+    entries: list[FileEntry] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "")
+        if not name or item.get("type") == 0:
+            continue
+        entries.append(FileEntry(name=name, path=name, size=_integer(item.get("FileSize"))))
+    return entries
+
+
+def jpeg_frames(buffer: bytearray, *, first_only: bool = False) -> list[bytes]:
+    """Remove every complete JPEG from the front of ``buffer``.
+
+    The printer's camera emits a full JPEG per multipart part, so a frame is
+    delimited by the start-of-image and end-of-image markers rather than by the
+    part headers, which are not reliable on this build.
+    """
+    frames: list[bytes] = []
+    while True:
+        start = buffer.find(JPEG_SOI)
+        if start < 0:
+            buffer.clear()
+            return frames
+        end = buffer.find(JPEG_EOI, start + len(JPEG_SOI))
+        if end < 0:
+            if start:
+                del buffer[:start]
+            return frames
+        frames.append(bytes(buffer[start : end + len(JPEG_EOI)]))
+        del buffer[: end + len(JPEG_EOI)]
+        if first_only:
+            return frames
+
+
+def _celsius(value: Any) -> Celsius | None:
+    number = _number(value)
+    return Celsius(number) if number is not None else None
+
+
+def _percent(value: Any) -> Percent | None:
+    number = _number(value)
+    if number is None:
+        return None
+    return Percent(min(max(number, 0.0), 100.0))
+
+
+class SdcpProtocol(Protocol):
+    """SDCP over a WebSocket, with the MJPEG camera on its own HTTP port."""
+
+    def __init__(
+        self,
+        config: PrinterConfig,
+        session: aiohttp.ClientSession,
+        *,
+        granted: frozenset[Capability],
+        unsafe: tuple[UnsafeFeature, ...] = (),
+    ) -> None:
+        """Create the adapter for one printer."""
+        super().__init__(config, session, granted=granted, unsafe=unsafe)
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._reader: asyncio.Task[None] | None = None
+        self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
+        self._status: dict[str, Any] = {}
+        self._attributes: dict[str, Any] = {}
+        self._file_list: list[FileEntry] = []
+        self._status_event = asyncio.Event()
+        self._attributes_event = asyncio.Event()
+        self._file_list_event = asyncio.Event()
+        self._mainboard_id = ""
+        self._send_lock = asyncio.Lock()
+
+    # --------------------------------------------------------------- addresses
+
+    @property
+    def ws_port(self) -> int:
+        """Return the SDCP port."""
+        return self.config.port or DEFAULT_WS_PORT
+
+    @property
+    def camera_port(self) -> int:
+        """Return the camera port, defaulting to the one this hardware uses."""
+        return self.config.camera_port or DEFAULT_CAMERA_PORT
+
+    @property
+    def ws_url(self) -> str:
+        """Return the SDCP WebSocket URL."""
+        scheme = "wss" if self.config.tls else "ws"
+        return f"{scheme}://{self.config.host}:{self.ws_port}{WS_PATH}"
+
+    @property
+    def camera_url(self) -> str:
+        """Return the MJPEG camera URL."""
+        return f"http://{self.config.host}:{self.camera_port}{CAMERA_PATH}"
+
+    @property
+    def web_ui_url(self) -> str:
+        """Return the printer's own web UI address."""
+        return f"http://{self.config.host}/"
+
+    @property
+    def attributes(self) -> Mapping[str, Any]:
+        """Return the last attributes payload the printer pushed."""
+        return self._attributes
+
+    # --------------------------------------------------------------- lifecycle
+
+    async def async_setup(self) -> None:
+        """Open the control socket and request the machine attributes once."""
+        if self._ws is not None and not self._ws.closed:
+            return
+
+        self._attributes_event.clear()
+        try:
+            # No heartbeat: this adapter reads frames continuously and reconnects on
+            # failure, so a ping timer would add nothing and would outlive teardown.
+            self._ws = await self._session.ws_connect(
+                self.ws_url,
+                heartbeat=None,
+                max_msg_size=16 * 1024 * 1024,
+            )
+        except aiohttp.WSServerHandshakeError as err:
+            if err.status == 500:
+                raise UnreachableError(
+                    "the printer refused the connection. It allows five SDCP clients "
+                    "at once and all of them are in use"
+                ) from err
+            raise UnreachableError(
+                f"the printer refused the WebSocket handshake with HTTP {err.status}"
+            ) from err
+        except aiohttp.ClientError as err:
+            raise UnreachableError(f"cannot reach {self.config.redacted_url}: {err}") from err
+        except TimeoutError as err:
+            raise UnreachableError(f"timeout contacting {self.config.redacted_url}") from err
+
+        self._reader = asyncio.create_task(self._async_read_frames())
+
+        await self._async_request(COMMAND["attributes"])
+        with suppress(TimeoutError):
+            await asyncio.wait_for(self._attributes_event.wait(), timeout=PUSH_TIMEOUT)
+
+        self._mainboard_id = str(self._attributes.get("MainboardID") or "")
+        _LOGGER.debug(
+            "%s: SDCP ready, mainboard %s, firmware %s",
+            self.config.name,
+            self._mainboard_id or "(unknown)",
+            self._attributes.get("FirmwareVersion"),
+        )
+
+    async def async_teardown(self) -> None:
+        """Close the socket and stop the reader. Idempotent."""
+        reader, self._reader = self._reader, None
+        if reader is not None and not reader.done():
+            reader.cancel()
+            with suppress(asyncio.CancelledError):
+                await reader
+
+        ws, self._ws = self._ws, None
+        if ws is not None and not ws.closed:
+            with suppress(aiohttp.ClientError, ConnectionResetError):
+                await ws.close()
+
+        for future in self._pending.values():
+            if not future.done():
+                future.cancel()
+        self._pending.clear()
+
+    # -------------------------------------------------------------- frame pump
+
+    async def _async_read_frames(self) -> None:
+        """Route every frame the printer sends until the socket closes."""
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            async for message in ws:
+                if message.type is aiohttp.WSMsgType.TEXT:
+                    self._handle_frame(message.data)
+                elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, ConnectionResetError) as err:
+            _LOGGER.debug("%s: SDCP socket ended: %s", self.config.name, err)
+        finally:
+            self._fail_pending(UnreachableError("the SDCP socket closed"))
+
+    def _fail_pending(self, error: Exception) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(error)
+        self._pending.clear()
+
+    def _handle_frame(self, raw: str) -> None:
+        """Dispatch one text frame by its topic.
+
+        Topics are string-routed and carry the mainboard id, so the second path
+        segment is what identifies the frame kind.
+        """
+        payload = load_frame(raw)
+        if payload is None:
+            return
+        topic = str(payload.get("Topic") or "")
+        parts = topic.split("/")
+        kind = parts[1] if len(parts) > 1 else ""
+
+        if kind == "response":
+            self._resolve_response(payload)
+        elif kind == "status":
+            status = payload.get("Status")
+            if isinstance(status, Mapping):
+                self._status = dict(status)
+                self._status_event.set()
+        elif kind == "attributes":
+            attributes = payload.get("Attributes")
+            if isinstance(attributes, Mapping):
+                self._attributes = dict(attributes)
+                self._attributes_event.set()
+        elif kind == "error":
+            _LOGGER.warning(
+                "%s: the printer reported an SDCP error: %s", self.config.name, raw[:400]
+            )
+
+    def _resolve_response(self, payload: Mapping[str, Any]) -> None:
+        """Complete the request whose ``RequestID`` this frame carries.
+
+        The envelope nests the payload one level deeper than the routing fields:
+        ``Data.RequestID`` identifies the request while ``Data.Data`` is the body.
+        Reading the body off the wrong level is why a file list looks empty while
+        the frame that carried it was received.
+        """
+        outer = payload.get("Data") or {}
+        body = outer.get("Data")
+        data: Mapping[str, Any] = body if isinstance(body, Mapping) else outer
+        request_id = str(outer.get("RequestID") or "")
+
+        # The file list shares its response frame with the acknowledgement and
+        # carries no request id of its own, so it is captured here rather than
+        # through the pending-request table.
+        if "FileList" in data:
+            self._file_list = parse_file_list(data.get("FileList"))
+            self._file_list_event.set()
+
+        if not request_id:
+            return
+        future = self._pending.pop(request_id, None)
+        if future is not None and not future.done():
+            future.set_result(data)
+
+    # --------------------------------------------------------------- requests
+
+    async def _async_request(
+        self,
+        cmd: int,
+        data: Mapping[str, Any] | None = None,
+        *,
+        timeout: float = ACK_TIMEOUT,
+    ) -> Mapping[str, Any] | None:
+        """Send one request and wait for its acknowledgement frame."""
+        if self._ws is None or self._ws.closed:
+            await self.async_setup()
+        ws = self._ws
+        if ws is None:
+            raise UnreachableError("the SDCP socket is not open")
+
+        request_id, frame = build_frame(self._mainboard_id, cmd, data)
+        future: asyncio.Future[Mapping[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+
+        try:
+            async with self._send_lock:
+                await ws.send_str(frame)
+        except (aiohttp.ClientError, ConnectionResetError) as err:
+            self._pending.pop(request_id, None)
+            raise UnreachableError(
+                f"cannot send to {self.config.redacted_url}: {err}"
+            ) from err
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except TimeoutError:
+            self._pending.pop(request_id, None)
+            raise ProtocolError(
+                f"the printer did not answer SDCP command {cmd} within {timeout:g}s"
+            ) from None
+
+    async def _async_send_checked(self, name: str, data: Mapping[str, Any]) -> None:
+        """Send a command and raise when the printer refuses it."""
+        response = await self._async_request(COMMAND[name], data)
+        ack = _integer((response or {}).get("Ack"))
+        if ack is not None and ack != 0:
+            raise CommandRejectedError(
+                f"the printer refused {name}: {ACK_MESSAGES.get(ack, 'unrecognised reason')}",
+                code=ack,
+                reason=ACK_MESSAGES.get(ack),
+            )
+
+    # ------------------------------------------------------------------- read
+
+    async def async_read(self) -> PrinterSnapshot:
+        """Return one snapshot, requesting status when no push has arrived.
+
+        The printer's push scheduler is documented as wedging on some firmware
+        while a one-shot request keeps working, so the poll path is the reliable
+        one and the push is the optimisation.
+        """
+        if not self._status:
+            self._status_event.clear()
+            await self._async_request(COMMAND["status"])
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._status_event.wait(), timeout=PUSH_TIMEOUT)
+
+        parsed = parse_status(self._status)
+        flags = parsed["current_status"]
+
+        elapsed = parsed["elapsed"]
+        total = parsed["total_ticks"]
+        # The printer exposes no remaining-time field; the two tick counters are
+        # the whole of it.
+        remaining = max(total - elapsed, 0.0) if elapsed is not None and total is not None else None
+
+        light_known = parsed["chamber_light"] is not None
+        return PrinterSnapshot(
+            protocol=ProtocolId.SDCP_CC1,
+            connected=self._ws is not None and not self._ws.closed,
+            capabilities=self.capabilities,
+            print_state=state_for(parsed["print_status"], flags),
+            progress=_percent(parsed["progress"]),
+            current_layer=parsed["current_layer"],
+            total_layers=parsed["total_layers"],
+            remaining=Seconds(remaining) if remaining is not None else None,
+            elapsed=Seconds(elapsed) if elapsed is not None else None,
+            filename=parsed["filename"],
+            job_id=parsed["job_id"],
+            speed_factor=_percent(parsed["speed_factor"]),
+            hotend=Temps(
+                current=_celsius(parsed["hotend_current"]),
+                target=_celsius(parsed["hotend_target"]),
+            ),
+            bed=Temps(
+                current=_celsius(parsed["bed_current"]),
+                target=_celsius(parsed["bed_target"]),
+            ),
+            chamber=Temps(
+                current=_celsius(parsed["chamber_current"]),
+                target=_celsius(parsed["chamber_target"]),
+            ),
+            fans=Fans(
+                model=_percent(parsed["fan_model"]),
+                auxiliary=_percent(parsed["fan_auxiliary"]),
+                chamber=_percent(parsed["fan_chamber"]),
+            ),
+            position=parsed["position"],
+            lights=frozenset({LightChannel.CHAMBER}) if light_known else frozenset(),
+            camera=self._attributes.get("CameraStatus") == 1,
+            model=str(self._attributes.get("MachineName") or "") or None,
+            firmware=str(self._attributes.get("FirmwareVersion") or "") or None,
+            serial=self._mainboard_id or None,
+        )
+
+    # --------------------------------------------------------------- commands
+
+    async def _async_dispatch(self, command: Command, params: Mapping[str, Any]) -> None:
+        """Translate one normalised command into an SDCP frame."""
+        handler = _DISPATCH.get(command)
+        if handler is None:
+            raise ProtocolError(f"the SDCP adapter cannot dispatch {command.value}")
+        await handler(self, params)
+
+    async def _async_start_print(self, params: Mapping[str, Any]) -> None:
+        """Send the six-field start-print payload, which is the whole risk surface."""
+        if 1 in status_flags(self._status.get("CurrentStatus")):
+            raise ProtocolError(
+                "refusing to start a print: the printer reports a job already in progress"
+            )
+        await self._async_send_checked(
+            "start_print",
+            {
+                "Filename": str(params["filename"]).rsplit("/", 1)[-1],
+                "StartLayer": 0,
+                "Calibration_switch": 1,
+                "PrintPlatformType": 0,
+                "Tlp_Switch": 0,
+                "slot_map": [],
+            },
+        )
+
+    async def _async_pause(self, _params: Mapping[str, Any]) -> None:
+        await self._async_send_checked("pause", {})
+
+    async def _async_resume(self, _params: Mapping[str, Any]) -> None:
+        await self._async_send_checked("resume", {})
+
+    async def _async_stop(self, _params: Mapping[str, Any]) -> None:
+        await self._async_send_checked("stop", {})
+
+    async def _async_set_hotend_temp(self, params: Mapping[str, Any]) -> None:
+        await self.set_printer_params({SET_HOTEND_FIELD: int(params["value"])})
+
+    async def _async_set_bed_temp(self, params: Mapping[str, Any]) -> None:
+        await self.set_printer_params({SET_BED_FIELD: int(params["value"])})
+
+    async def _async_set_chamber_temp(self, params: Mapping[str, Any]) -> None:
+        await self.set_printer_params({SET_CHAMBER_FIELD: int(params["value"])})
+
+    async def set_printer_params(self, payload: Mapping[str, Any]) -> None:
+        """Send one variant of the overloaded 403 print-parameter command."""
+        await self._async_send_checked("set_params", payload)
+
+    async def _async_set_fan(self, params: Mapping[str, Any]) -> None:
+        channel = str(params.get("channel", "model"))
+        key = _FAN_KEYS.get(channel)
+        if key is None:
+            raise ProtocolError(
+                f"this printer has no {channel} fan; it exposes model, auxiliary and chamber"
+            )
+        await self._async_send_checked(
+            "set_params", {"TargetFanSpeed": {key: int(params["value"])}}
+        )
+
+    async def _async_set_speed(self, params: Mapping[str, Any]) -> None:
+        await self._async_send_checked("set_params", {"PrintSpeedPct": int(params["value"])})
+
+    async def _async_set_light(self, params: Mapping[str, Any]) -> None:
+        await self._async_send_checked(
+            "set_params", {"LightStatus": {"SecondLight": 1 if params["on"] else 0}}
+        )
+
+    # ------------------------------------------------------------------ files
+
+    async def async_list_files(self) -> Sequence[FileEntry]:
+        """Return the files on the printer's internal storage."""
+        self._file_list_event.clear()
+        self._file_list = []
+        response = await self._async_request(COMMAND["file_list"], {"Url": "/local"})
+
+        # Observed on hardware: the ack and the list are separate frames, so the
+        # ack frame alone carries no files.
+        if "FileList" in (response or {}):
+            self._file_list = parse_file_list((response or {}).get("FileList"))
+        elif not self._file_list:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._file_list_event.wait(), timeout=PUSH_TIMEOUT)
+        return list(self._file_list)
+
+    async def _async_delete_file(self, params: Mapping[str, Any]) -> None:
+        name = str(params["filename"])
+        if not name.startswith("/"):
+            name = f"/local/{name}"
+        await self._async_send_checked("delete_files", {"FileList": [name]})
+
+    async def async_upload_file(
+        self, name: str, stream: AsyncIterator[bytes], *, size: int | None = None
+    ) -> FileEntry:
+        """Upload a file in 1 MiB chunks over HTTP.
+
+        The upload shares neither the port nor the socket of the control channel, so
+        it cannot trip the unverified-command crash path.
+        """
+        payload = bytearray()
+        async for chunk in stream:
+            payload.extend(chunk)
+        body = bytes(payload)
+        total = len(body)
+        filename = name.rsplit("/", 1)[-1]
+        digest = hashlib.md5(body).hexdigest()  # noqa: S324 - required by the printer's protocol
+        transfer_id = uuid.uuid4().hex
+        url = f"{self.config.scheme}://{self.config.host}{UPLOAD_PATH}"
+
+        offset = 0
+        while True:
+            chunk = body[offset : offset + UPLOAD_CHUNK]
+            form = aiohttp.FormData()
+            form.add_field("Check", "1")
+            form.add_field("S-File-MD5", digest)
+            form.add_field("Offset", str(offset))
+            form.add_field("Uuid", transfer_id)
+            form.add_field("TotalSize", str(total))
+            form.add_field(
+                "File", chunk, filename=filename, content_type="application/octet-stream"
+            )
+
+            try:
+                async with self._session.post(
+                    url, data=form, timeout=aiohttp.ClientTimeout(total=180)
+                ) as response:
+                    result = await _response_json(response)
+            except aiohttp.ClientError as err:
+                raise UnreachableError(f"the upload failed: {err}") from err
+
+            if result is not None and str(result.get("code")) not in ("000000", "None"):
+                raise CommandRejectedError(
+                    f"the printer refused the upload: {result.get('messages')}",
+                    code=result.get("code"),
+                )
+
+            offset += UPLOAD_CHUNK
+            if offset >= total:
+                break
+
+        return FileEntry(name=filename, path=f"/local/{filename}", size=total)
+
+    # ----------------------------------------------------------------- camera
+
+    async def async_camera_frame(self) -> bytes:
+        """Return one JPEG frame read from the printer's MJPEG stream."""
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=10)
+        try:
+            async with self._session.get(self.camera_url, timeout=timeout) as response:
+                if response.status >= 400:
+                    raise UnreachableError(f"the camera answered HTTP {response.status}")
+                buffer = bytearray()
+                async for chunk in response.content.iter_chunked(STREAM_CHUNK):
+                    buffer.extend(chunk)
+                    frames = jpeg_frames(buffer, first_only=True)
+                    if frames:
+                        return frames[0]
+                    if len(buffer) > MAX_FRAME_BYTES:
+                        raise UnreachableError("the camera frame exceeded the size cap")
+        except aiohttp.ClientError as err:
+            raise UnreachableError(f"cannot reach the camera: {err}") from err
+        except TimeoutError as err:
+            raise UnreachableError("the camera did not deliver a frame") from err
+        raise UnreachableError("the camera stream ended before a complete frame arrived")
+
+    async def async_camera_stream(self) -> AsyncIterator[bytes]:
+        """Yield JPEG frames from the printer's camera until the caller stops.
+
+        One caller holds one upstream connection. The printer's camera server has a
+        very small pool of connection slots and leaks them on disconnect, so frames
+        are fanned out downstream from here rather than per viewer.
+        """
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=15)
+        async with self._session.get(self.camera_url, timeout=timeout) as response:
+            if response.status >= 400:
+                raise UnreachableError(f"the camera answered HTTP {response.status}")
+            buffer = bytearray()
+            async for chunk in response.content.iter_chunked(STREAM_CHUNK):
+                buffer.extend(chunk)
+                for frame in jpeg_frames(buffer):
+                    yield frame
+
+
+async def _response_json(response: aiohttp.ClientResponse) -> Mapping[str, Any] | None:
+    """Decode a JSON body, returning ``None`` for an empty or non-JSON answer."""
+    try:
+        text = await response.text()
+    except (aiohttp.ClientError, UnicodeDecodeError):
+        return None
+    if not text.strip():
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+#: ``Command`` to handler. The 403 payload variant is chosen by the command and
+#: stays one layer down, so the normalised vocabulary remains a statement about
+#: printers rather than about Elegoo.
+_DISPATCH: Final[Mapping[Command, Any]] = MappingProxyType(
+    {
+        Command.START_PRINT: SdcpProtocol._async_start_print,
+        Command.PAUSE: SdcpProtocol._async_pause,
+        Command.RESUME: SdcpProtocol._async_resume,
+        Command.STOP: SdcpProtocol._async_stop,
+        Command.SET_FAN_SPEED: SdcpProtocol._async_set_fan,
+        Command.SET_SPEED: SdcpProtocol._async_set_speed,
+        Command.SET_LIGHT: SdcpProtocol._async_set_light,
+        Command.DELETE_FILE: SdcpProtocol._async_delete_file,
+        Command.SET_HOTEND_TEMP: SdcpProtocol._async_set_hotend_temp,
+        Command.SET_BED_TEMP: SdcpProtocol._async_set_bed_temp,
+        Command.SET_CHAMBER_TEMP: SdcpProtocol._async_set_chamber_temp,
+    }
+)
