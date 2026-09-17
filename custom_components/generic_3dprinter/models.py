@@ -1,0 +1,255 @@
+"""The normalised printer model.
+
+`PrinterSnapshot` is the only currency between an adapter and everything else in
+the integration. It is frozen, and every field a protocol might not be able to
+express defaults to `None` or an empty collection.
+
+That is not hedging. It is the measured truth of this fleet: OctoPrint and
+PrusaLink report no layer count at all, Duet computes progress instead of
+reporting it, and a web-only printer has no state surface whatsoever. `None`
+means "this printer has no such reading", and the card hides the row rather than
+the adapter inventing a number.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, NewType
+
+from .const import Capability, LightChannel, PrintState, ProtocolId
+
+#: Branded scalars. At runtime these are floats; the brand is documentation the
+#: type checker enforces, because Bambu and Anycubic report remaining time in
+#: minutes while every other protocol reports seconds. That mistake is invisible
+#: in a bare float.
+Celsius = NewType("Celsius", float)
+Seconds = NewType("Seconds", float)
+Percent = NewType("Percent", float)
+Millimetres = NewType("Millimetres", float)
+
+
+@dataclass(frozen=True, slots=True)
+class Temps:
+    """Current and target temperature for one heater."""
+
+    current: Celsius | None = None
+    target: Celsius | None = None
+
+    @property
+    def known(self) -> bool:
+        """Return ``True`` when either reading is present."""
+        return self.current is not None or self.target is not None
+
+    def as_dict(self) -> dict[str, float | None]:
+        """Return a JSON-safe mapping."""
+        return {"current": self.current, "target": self.target}
+
+
+@dataclass(frozen=True, slots=True)
+class Fans:
+    """Fan duty per channel, as a percentage.
+
+    Protocols that report duty in device units normalise here. Bambu reports 0 to
+    15, so its adapter multiplies. Protocols that can only report revolutions per
+    minute leave every channel `None` rather than publish a value in the wrong
+    unit.
+    """
+
+    model: Percent | None = None
+    auxiliary: Percent | None = None
+    chamber: Percent | None = None
+    hotend: Percent | None = None
+    controller: Percent | None = None
+
+    @property
+    def known(self) -> bool:
+        """Return ``True`` when any channel has a reading."""
+        return any(
+            getattr(self, item.name) is not None for item in fields(self)
+        )
+
+    def as_dict(self) -> dict[str, float | None]:
+        """Return a JSON-safe mapping."""
+        return {item.name: getattr(self, item.name) for item in fields(self)}
+
+
+@dataclass(frozen=True, slots=True)
+class Axis:
+    """Toolhead position in millimetres."""
+
+    x: Millimetres | None = None
+    y: Millimetres | None = None
+    z: Millimetres | None = None
+
+    def as_dict(self) -> dict[str, float | None]:
+        """Return a JSON-safe mapping."""
+        return {"x": self.x, "y": self.y, "z": self.z}
+
+
+@dataclass(frozen=True, slots=True)
+class FileEntry:
+    """One stored G-code file."""
+
+    name: str
+    path: str
+    size: int | None = None
+    modified: datetime | None = None
+
+    @property
+    def display_name(self) -> str:
+        """Return the file name without its storage path."""
+        return self.name.rsplit("/", 1)[-1]
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe mapping."""
+        return {
+            "name": self.name,
+            "path": self.path,
+            "size": self.size,
+            "modified": self.modified.isoformat() if self.modified else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PrinterSnapshot:
+    """One complete, normalised view of a printer at one instant.
+
+    The first four fields are always known, because the adapter itself owns them.
+    Everything the printer reports is optional.
+    """
+
+    protocol: ProtocolId
+    connected: bool
+    capabilities: frozenset[Capability] = frozenset()
+    print_state: PrintState = PrintState.UNKNOWN
+
+    # --- job
+    progress: Percent | None = None
+    current_layer: int | None = None
+    total_layers: int | None = None
+    remaining: Seconds | None = None
+    elapsed: Seconds | None = None
+    filename: str | None = None
+    job_id: str | None = None
+    speed_factor: Percent | None = None
+    flow_factor: Percent | None = None
+
+    # --- heaters
+    hotend: Temps = Temps()
+    bed: Temps = Temps()
+    chamber: Temps = Temps()
+
+    # --- mechanism
+    fans: Fans = Fans()
+    position: Axis | None = None
+    homed_axes: frozenset[str] = frozenset()
+    lights: frozenset[LightChannel] = frozenset()
+
+    # --- camera
+    camera: bool = False
+
+    # --- provenance
+    model: str | None = None
+    firmware: str | None = None
+    serial: str | None = None
+    errors: tuple[str, ...] = ()
+
+    @property
+    def idle(self) -> bool:
+        """Return ``True`` when the machine is idle.
+
+        Derived rather than stored, so it cannot contradict :attr:`print_state`.
+        """
+        return self.print_state is PrintState.IDLE
+
+    @property
+    def busy(self) -> bool:
+        """Return ``True`` when a job is running or held."""
+        return self.print_state in (PrintState.PRINTING, PrintState.PAUSED)
+
+    @property
+    def has_job(self) -> bool:
+        """Return ``True`` when a job is in progress or just finished."""
+        return self.print_state in (
+            PrintState.PRINTING,
+            PrintState.PAUSED,
+            PrintState.FINISHED,
+            PrintState.CANCELLED,
+        )
+
+    def supports(self, capability: Capability) -> bool:
+        """Return ``True`` when this printer grants ``capability`` right now."""
+        return capability in self.capabilities
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe document for the card, diagnostics and attributes."""
+        return {
+            "protocol": self.protocol.value,
+            "connected": self.connected,
+            "print_state": self.print_state.value,
+            "capabilities": sorted(item.value for item in self.capabilities),
+            "progress": self.progress,
+            "current_layer": self.current_layer,
+            "total_layers": self.total_layers,
+            "remaining": self.remaining,
+            "elapsed": self.elapsed,
+            "filename": self.filename,
+            "job_id": self.job_id,
+            "speed_factor": self.speed_factor,
+            "flow_factor": self.flow_factor,
+            "hotend": self.hotend.as_dict(),
+            "bed": self.bed.as_dict(),
+            "chamber": self.chamber.as_dict(),
+            "fans": self.fans.as_dict(),
+            "position": self.position.as_dict() if self.position else None,
+            "homed_axes": sorted(self.homed_axes),
+            "lights": sorted(item.value for item in self.lights),
+            "camera": self.camera,
+            "model": self.model,
+            "firmware": self.firmware,
+            "serial": self.serial,
+            "errors": list(self.errors),
+        }
+
+
+@dataclass(slots=True)
+class PrinterStatus:
+    """A serialisable health and capability report, used by the card and diagnostics."""
+
+    entry_id: str
+    name: str
+    protocol: ProtocolId
+    model: str | None
+    firmware: str | None
+    online: bool
+    last_error: str | None
+    last_seen: datetime | None
+    snapshot: PrinterSnapshot
+    web_ui_url: str | None = None
+    web_proxy_url: str | None = None
+    camera_url: str | None = None
+    snapshot_url: str | None = None
+    files: list[FileEntry] = field(default_factory=list)
+    unsafe_features: tuple[dict[str, str], ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe document."""
+        return {
+            "entry_id": self.entry_id,
+            "name": self.name,
+            "protocol": self.protocol.value,
+            "model": self.model,
+            "firmware": self.firmware,
+            "online": self.online,
+            "last_error": self.last_error,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+            "web_ui_url": self.web_ui_url,
+            "web_proxy_url": self.web_proxy_url,
+            "camera_url": self.camera_url,
+            "snapshot_url": self.snapshot_url,
+            "unsafe_features": list(self.unsafe_features),
+            "printer": self.snapshot.as_dict(),
+            "files": [item.as_dict() for item in self.files],
+        }
