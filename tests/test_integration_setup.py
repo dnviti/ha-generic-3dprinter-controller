@@ -60,11 +60,18 @@ async def test_the_whole_lifecycle(
         "switch",
     }, sorted(item.entity_id for item in entries)
 
-    # Every entity took its name from the integration's translations. A fallback to
-    # the device class would have produced colliding ids with a numeric suffix.
+    # Every named entity took its name from the integration's translations. An
+    # entity that fell back to the device name would have left its own name empty
+    # and collided with its siblings. The camera is the deliberate exception: it is
+    # one per printer and named after the printer, which is the shape a fleet
+    # dashboard expects from a printer's camera.
+    device_name = config_entry.data["name"]
     for item in entries:
-        assert not item.entity_id.endswith(tuple(f"_{n}" for n in range(2, 10))), (
-            f"{item.entity_id} collided with another entity, which means its "
+        if item.entity_id.startswith("camera."):
+            assert item.original_name == device_name
+            continue
+        assert item.original_name and item.original_name != device_name, (
+            f"{item.entity_id} is named {item.original_name!r}, which means its "
             f"translated name was not found"
         )
 
@@ -72,6 +79,12 @@ async def test_the_whole_lifecycle(
         match = next((item for item in entries if item.translation_key == translation_key), None)
         assert match is not None, f"no entity with translation key {translation_key!r}"
         return hass.states.get(match.entity_id)
+
+    # The camera is the one entity with no translation key: it is a single entity
+    # per printer named after the printer.
+    camera = next((item for item in entries if item.entity_id.startswith("camera.")), None)
+    assert camera is not None, sorted(item.entity_id for item in entries)
+    assert camera.translation_key is None
 
     assert state_for("printer_state").state == "printing"
     assert float(state_for("progress").state) == pytest.approx(12.0)

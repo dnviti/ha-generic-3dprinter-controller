@@ -90,6 +90,8 @@ async def config_entry_fixture(hass, printer):
             "protocol": "sdcp_cc1",
             "host": "127.0.0.1",
             "port": port,
+            # The fake serves its camera on its own origin, like the real hardware.
+            "camera_port": printer.camera_port,
             "scan_interval": 5,
         },
         unique_id=f"sdcp_cc1:127.0.0.1:{port}:{_PRINTER_SEQUENCE}",

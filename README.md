@@ -1,4 +1,4 @@
-﻿# Generic 3D Printer Controller
+# Generic 3D Printer Controller
 
 One Home Assistant integration for a **mixed 3D printer fleet**. Each printer is a
 config entry, each protocol is an adapter, and everything a user sees reads one
@@ -34,9 +34,11 @@ address.
 factor, flow factor and fan duty as numbers; the chamber light as a switch. Each
 one exists only when the printer says it supports it.
 
-**Camera.** A camera entity fed by one shared upstream connection, so a dashboard
-tile, a card and a notification do not each open their own. This matters on
-hardware whose camera server keeps only a few connection slots and leaks them.
+**Camera.** A live MJPEG stream, not a slideshow. The card and Home Assistant's own
+camera proxy both read from one shared upstream connection per printer, so a
+dashboard tile, the card and a notification do not each open their own. That
+sharing is a requirement on hardware whose camera server keeps only a few
+connection slots and leaks them.
 
 **The printer's own page.** For a printer with no control API, its embedded page is
 reverse-proxied through Home Assistant and its control WebSocket is bridged, so a
@@ -201,21 +203,17 @@ component. Entity names come from there, not from `strings.json`.
 ## Development
 
 ```bash
-python -m pytest tests/ -q --ignore=tests/test_integration_setup.py
-python -m pytest tests/test_integration_setup.py -q
-npm test
+python -m pytest tests/ -q     # 132 tests, about sixteen seconds
+npm test                       # 16 card tests
 ```
 
-The fast suite runs in about fifteen seconds. The integration test loads a real
-Home Assistant and takes about two minutes because the test double's socket keeps
-Home Assistant's shutdown waiting; that cost is documented in the file.
-
-`tools/` holds the instruments used to reverse the SDCP protocol, each one
-runnable against real hardware:
+`tools/` holds the instruments used to work on the SDCP protocol and to prove the
+integration against real hardware:
 
 | Tool | Purpose |
 | --- | --- |
 | `tools/acceptance_sdcp.py` | Drive the real adapter against a real printer, 21 checks |
+| `tools/acceptance_camera.py` | Measure a printer's camera: frames, distinct frames, frame rate |
 | `tools/probe_sdcp.py` | Dump every raw SDCP frame a printer sends |
 | `tools/dump_status.py` | Print the status, attributes and file-list schemas |
 | `tools/mine_printer_bundle.py` | Walk a printer's own JS bundle for its API surface |

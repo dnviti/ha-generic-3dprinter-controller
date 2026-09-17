@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0
+
+**Fixed**
+
+* **The camera is live.** It was not before. The card loaded a still snapshot, which
+  only changed when the card polled, so a live camera looked like a slideshow that
+  updated every few seconds. The card now loads the integration's MJPEG stream and
+  the picture moves.
+* **The camera stream never worked at all**, which is why the snapshot was the only
+  thing that appeared. The stream view handed the frame iterator to `async with`,
+  and an async generator is not a context manager, so the response closed empty on
+  the first line. A regression test now drives the real camera view over HTTP and
+  asserts that distinct frames keep arriving.
+* The camera's idle timer is cancelled on unload instead of being left sleeping on
+  the event loop after the printer has gone.
+
+**Added**
+
+* `tools/acceptance_camera.py`, which measures a printer's camera against real
+  hardware and reports the frame rate and how many frames were distinct.
+
+**Notes**
+
+* Verified on a live Elegoo Centauri Carbon: 49 distinct frames in 6 seconds, about
+  8 frames per second, one upstream connection for the whole run.
+
 ## 0.1.0
 
 First release.
@@ -53,6 +79,3 @@ First release.
 
 * Entity names come from `translations/en.json`. Run
   `tools/sync_translations.py` after editing `strings.json`.
-* The integration test loads a real Home Assistant and takes about two minutes,
-  because the test double's socket keeps Home Assistant's shutdown waiting. The
-  fast suite runs in about fifteen seconds.

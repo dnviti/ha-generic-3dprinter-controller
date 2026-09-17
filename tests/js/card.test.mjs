@@ -258,14 +258,52 @@ test("a printer without a camera renders no camera pane", async () => {
   assert.ok(texts(card, ".ctl").includes("Pause"));
 });
 
-test("passing a camera snapshot url into an image element", async () => {
+test("the camera pane loads the live stream, not a still snapshot", async () => {
   const { card } = await mountCard({
     printers: [{ entry_id: "entry1", name: "Camera" }],
     descriptions: { entry1: description() },
   });
   const image = card.shadowRoot.querySelector(".camera img");
   assert.ok(image, "expected a camera image");
+  // A snapshot only changes when the card polls, which is what made a live camera
+  // look like a slideshow.
+  assert.equal(image.getAttribute("src"), "/api/generic_3dprinter/entry1/camera.mjpeg/tok");
+  assert.equal(image.dataset.mode, "stream");
+});
+
+test("without a stream url the camera falls back to the still", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "Camera" }],
+    descriptions: { entry1: description({ camera_url: null }) },
+  });
+  const image = card.shadowRoot.querySelector(".camera img");
+  assert.ok(image, "expected a camera image");
   assert.equal(image.getAttribute("src"), "/api/generic_3dprinter/entry1/snapshot.jpg/tok");
+  assert.equal(image.dataset.mode, "snapshot");
+});
+
+test("a stream that fails degrades to the still instead of vanishing", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "Camera" }],
+    descriptions: { entry1: description() },
+  });
+  const image = card.shadowRoot.querySelector(".camera img");
+  image.dispatchEvent(new card.ownerDocument.defaultView.Event("error"));
+  assert.equal(image.dataset.mode, "snapshot");
+  assert.equal(image.getAttribute("src"), "/api/generic_3dprinter/entry1/snapshot.jpg/tok");
+});
+
+test("redrawing the card keeps the same stream url so the stream is not restarted", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "Camera" }],
+    descriptions: { entry1: description() },
+  });
+  const before = card.shadowRoot.querySelector(".camera img").getAttribute("src");
+  await card._refreshAll();
+  const after = card.shadowRoot.querySelector(".camera img").getAttribute("src");
+  // An identical src is a no-op in the DOM, so an existing viewer keeps its one
+  // upstream connection. A changing url would tear the stream down every poll.
+  assert.equal(after, before);
 });
 
 test("pressing pause sends the normalised command over the websocket api", async () => {

@@ -25,7 +25,7 @@ one origin::
 from __future__ import annotations
 
 import logging
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from http import HTTPStatus
 from typing import Final
 from urllib.parse import quote
@@ -142,7 +142,10 @@ async def async_proxy_mjpeg_stream(
     boundary = STREAM_BOUNDARY.encode("ascii")
     try:
         first = True
-        async with runtime.camera.async_subscribe() as frames:
+        # aclosing, not ``async with``: the hub hands back an async generator, and a
+        # generator is not a context manager. Getting this wrong closes the response
+        # on the first line and the viewer sees an empty stream with no error.
+        async with aclosing(runtime.camera.async_subscribe()) as frames:
             async for frame in frames:
                 if not frame:
                     continue
@@ -163,7 +166,7 @@ async def async_proxy_mjpeg_stream(
     except ConnectionResetError:
         _LOGGER.debug("%s: viewer disconnected from the camera stream", runtime.config.name)
     except Exception as err:  # noqa: BLE001 - a broken stream must not take the view down
-        _LOGGER.debug("%s: camera stream ended: %s", runtime.config.name, err)
+        _LOGGER.warning("%s: the camera stream ended: %s", runtime.config.name, err)
     finally:
         await async_write_eof(response)
     return response

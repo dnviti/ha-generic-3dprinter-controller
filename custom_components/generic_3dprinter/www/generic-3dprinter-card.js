@@ -11,7 +11,7 @@
  * soon as the integration is installed.
  */
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.2.0";
 
 const WS_LIST = "generic_3dprinter/list";
 const WS_DESCRIBE = "generic_3dprinter/describe";
@@ -277,14 +277,42 @@ class Generic3DPrinterCard extends HTMLElement {
   }
 
   _renderCamera(description, capabilities) {
-    if (!capabilities.includes("camera") || !description.snapshot_url) return null;
+    if (!capabilities.includes("camera")) return null;
+
+    /* The live stream is the whole point of the camera pane, so it is preferred.
+     * A still snapshot only moves when this card polls, which makes the picture
+     * change every REFRESH_MS instead of moving.
+     *
+     * Re-rendering must not restart the stream: the element is rebuilt on every
+     * poll, and assigning an identical value to `src` is a no-op in the DOM, so a
+     * viewer that is already watching keeps its one upstream connection. That
+     * matters on hardware whose camera server keeps only a few slots. */
+    const live = description.camera_url;
+    const still = description.snapshot_url;
+    if (!live && !still) return null;
+
     const column = el("div", "camera");
     const image = el("img");
-    image.src = description.snapshot_url;
     image.alt = "Printer camera";
-    image.addEventListener("error", () => {
-      image.replaceWith(el("div", "camera-error", "Camera unavailable"));
-    });
+    image.dataset.mode = live ? "stream" : "snapshot";
+
+    if (live) {
+      image.addEventListener("error", () => {
+        if (image.dataset.mode !== "stream") return;
+        if (!still) {
+          image.replaceWith(el("div", "camera-error", "Camera unavailable"));
+          return;
+        }
+        image.dataset.mode = "snapshot";
+        image.src = still;
+      });
+    } else {
+      image.addEventListener("error", () => {
+        image.replaceWith(el("div", "camera-error", "Camera unavailable"));
+      });
+    }
+
+    image.src = live || still;
     column.appendChild(image);
     return column;
   }

@@ -1,14 +1,16 @@
 """A fake SDCP printer for the test suite.
 
-It speaks the frame shapes a real Centauri Carbon produces, including the detail
-that matters most for a parser: a command is acknowledged in one frame and its
-payload can arrive in another. Collapsing the two is how a fake passes while the
-real adapter hangs.
+It speaks the frame shapes a real Centauri Carbon produces, including the two
+details that matter most: a command is acknowledged in one frame and its payload
+can arrive in another, and the camera lives on a port of its own. Collapsing either
+one is how a fake passes while the real adapter hangs.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import suppress
 
 #: The mainboard id reported by the printer this fake was shaped from.
 MAINBOARD = "5c441dd30105041800009c0000000000"
@@ -55,10 +57,21 @@ class FakePrinterServer:
         self.received: list[dict] = []
         self.sent_commands: list[int] = []
         self.url: str = ""
+        self.camera_port: int = 0
+        #: How many clients have opened the camera stream, and how many frames it
+        #: has produced. Together they prove a live stream rather than a still.
+        self.camera_connections = 0
+        self.camera_frames_sent = 0
         self._server = None
+        self._camera_server = None
 
     async def start(self) -> str:
-        """Start the server and return its ``ws://`` URL."""
+        """Start the server and return its ``http://`` URL.
+
+        The camera gets its own origin, exactly as the real hardware does: the
+        control socket is on one port and the MJPEG stream on another, which is why
+        the adapter is configured with a camera port rather than assuming one.
+        """
         from aiohttp import web
 
         app = web.Application()
@@ -70,13 +83,71 @@ class FakePrinterServer:
         self._server = runner
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
         self.url = f"http://127.0.0.1:{port}"
+
+        camera_app = web.Application()
+        camera_app.router.add_get("/video", self._handle_camera)
+        camera_runner = web.AppRunner(camera_app)
+        await camera_runner.setup()
+        camera_site = web.TCPSite(camera_runner, "127.0.0.1", 0)
+        await camera_site.start()
+        self._camera_server = camera_runner
+        self.camera_port = camera_site._server.sockets[0].getsockname()[1]  # noqa: SLF001
         return self.url
 
     async def stop(self) -> None:
-        """Stop the server."""
-        if self._server is not None:
-            await self._server.cleanup()
-            self._server = None
+        """Stop both servers."""
+        for attribute in ("_server", "_camera_server"):
+            runner = getattr(self, attribute, None)
+            if runner is not None:
+                await runner.cleanup()
+                setattr(self, attribute, None)
+
+    async def _handle_camera(self, request):
+        """Stream multipart JPEG until the client goes away.
+
+        Frames are produced on a timer rather than on connect, so a test can prove
+        the stream is live by watching more than one distinct frame arrive.
+        """
+        from aiohttp import web
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "multipart/x-mixed-replace; boundary=--foo",
+                "Cache-Control": "no-cache",
+            },
+        )
+        await response.prepare(request)
+        self.camera_connections += 1
+        try:
+            for index in range(120):
+                self.camera_frames_sent += 1
+                frame = self._jpeg(index)
+                part = (
+                    b"--foo\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(frame)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+                await response.write(part)
+                await asyncio.sleep(0.05)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            with suppress(ConnectionResetError, RuntimeError):
+                await response.write_eof()
+        return response
+
+    @staticmethod
+    def _jpeg(index: int) -> bytes:
+        """Return a tiny but structurally valid JPEG whose bytes vary per frame.
+
+        The marker bytes are what the adapter scans for, and the payload byte makes
+        two frames distinguishable so a test can tell a live stream from a still.
+        """
+        payload = b"fake-jpeg-%03d" % index
+        return b"\xff\xd8" + payload + b"\xff\xd9"
 
     async def _handle(self, request):
         from aiohttp import WSMsgType, web

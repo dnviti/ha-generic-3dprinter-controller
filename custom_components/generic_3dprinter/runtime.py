@@ -89,6 +89,9 @@ class CameraHub:
         self._supervisor: asyncio.Task[None] | None = None
         self._idle_task: asyncio.Task[None] | None = None
         self._backoff = 1.0
+        #: Set while the runtime is being torn down, so a departing viewer does not
+        #: re-arm the idle timer on the way out.
+        self._stopping = False
 
     @property
     def last_frame(self) -> bytes | None:
@@ -130,6 +133,7 @@ class CameraHub:
     async def _async_iter_frames(self) -> AsyncIterator[bytes]:
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
         self._subscribers.add(queue)
+        self._stopping = False
         if self._idle_task is not None:
             self._idle_task.cancel()
             self._idle_task = None
@@ -140,7 +144,10 @@ class CameraHub:
                 yield frame
         finally:
             self._subscribers.discard(queue)
-            if not self._subscribers:
+            # Only arm the idle timer when this hub is still in service. Arming it
+            # while the runtime is shutting down leaves a sleep pending on the loop
+            # after the printer has gone, which is a task leak rather than a feature.
+            if not self._subscribers and not self._stopping:
                 self._idle_task = asyncio.create_task(self._async_stop_when_idle())
 
     def _ensure_supervisor(self) -> None:
@@ -148,7 +155,15 @@ class CameraHub:
             self._supervisor = asyncio.create_task(self._async_supervise())
 
     async def _async_stop_when_idle(self) -> None:
-        await asyncio.sleep(IDLE_STOP_DELAY)
+        """Close the upstream connection once nobody has been watching for a while.
+
+        A viewer that comes back within the delay reuses the open connection instead
+        of paying for a new one, which matters on a camera server with few slots.
+        """
+        try:
+            await asyncio.sleep(IDLE_STOP_DELAY)
+        except asyncio.CancelledError:
+            raise
         if not self._subscribers:
             await self.async_stop()
 
@@ -203,12 +218,25 @@ class CameraHub:
         return frame
 
     async def async_stop(self) -> None:
-        """Stop the supervisor and drop every subscriber."""
+        """Stop the supervisor, the idle timer, and drop every subscriber.
+
+        The idle timer is cancelled here as well as the supervisor, because it is a
+        sleep that outlives the viewer that scheduled it: leaving it pending means a
+        task still waiting on the loop after the printer has been unloaded.
+        """
+        self._stopping = True
+        idle, self._idle_task = self._idle_task, None
+        if idle is not None and not idle.done():
+            idle.cancel()
+            with suppress(asyncio.CancelledError):
+                await idle
+
         supervisor, self._supervisor = self._supervisor, None
         if supervisor is not None and not supervisor.done():
             supervisor.cancel()
             with suppress(asyncio.CancelledError):
                 await supervisor
+
         for queue in list(self._subscribers):
             with suppress(asyncio.QueueFull):
                 queue.put_nowait(b"")
