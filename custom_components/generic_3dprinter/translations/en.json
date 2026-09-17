@@ -1,0 +1,253 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a 3D printer",
+        "description": "This integration speaks {count} printer protocols. You can let it look for a printer on your network, or choose the protocol yourself.",
+        "data": {
+          "discover": "Look for a printer on my network"
+        }
+      },
+      "protocol": {
+        "title": "Which protocol does the printer speak?",
+        "description": "Pick the printer's control protocol, not its brand. If you are unsure, choose Web page only and the integration will proxy the printer's own page.",
+        "data": {
+          "protocol": "Protocol"
+        }
+      },
+      "details": {
+        "title": "Printer details",
+        "description": "{protocol}. Default port: {ports}.\n\n{evidence}\n\n{detail}",
+        "data": {
+          "name": "Name",
+          "host": "Host or IP address",
+          "port": "Port",
+          "web_url": "Web UI address",
+          "camera_port": "Camera port",
+          "tls": "Use TLS",
+          "verify_ssl": "Verify the TLS certificate",
+          "scan_interval": "Poll interval",
+          "api_key": "API key",
+          "username": "Username",
+          "password": "Password",
+          "access_code": "Access code"
+        }
+      },
+      "unsafe": {
+        "title": "Commands that can damage the printer",
+        "description": "{hazards}\n\nLeave these off unless you accept the risk. You can change them later in the integration options.",
+        "data": {
+          "unsafe_sdcp_start_print": "Allow starting a print over the network"
+        }
+      }
+    },
+    "error": {
+      "invalid_config": "That configuration is not usable. Check the address, the port and any credential.",
+      "discovery_failed": "Nothing answered. Enter the printer's address by hand and choose its protocol.",
+      "cannot_connect": "The printer did not answer.",
+      "invalid_auth": "The printer refused the credential."
+    },
+    "abort": {
+      "already_configured": "That printer is already configured.",
+      "unknown": "Something went wrong."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Printer options",
+        "description": "{protocol}\n\n{hazards}",
+        "data": {
+          "name": "Name",
+          "host": "Host or IP address",
+          "port": "Port",
+          "scan_interval": "Poll interval",
+          "verify_ssl": "Verify the TLS certificate",
+          "api_key": "API key",
+          "username": "Username",
+          "password": "Password",
+          "access_code": "Access code",
+          "unsafe_sdcp_start_print": "Allow starting a print over the network"
+        }
+      }
+    },
+    "error": {
+      "invalid_config": "That configuration is not usable."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "printer_state": {
+        "name": "State"
+      },
+      "progress": {
+        "name": "Progress"
+      },
+      "current_layer": {
+        "name": "Current layer"
+      },
+      "total_layers": {
+        "name": "Total layers"
+      },
+      "remaining_time": {
+        "name": "Time remaining"
+      },
+      "elapsed_time": {
+        "name": "Time elapsed"
+      },
+      "filename": {
+        "name": "File"
+      },
+      "nozzle_temperature": {
+        "name": "Nozzle temperature"
+      },
+      "nozzle_target_temperature": {
+        "name": "Nozzle target"
+      },
+      "bed_temperature": {
+        "name": "Bed temperature"
+      },
+      "bed_target_temperature": {
+        "name": "Bed target"
+      },
+      "chamber_temperature": {
+        "name": "Chamber temperature"
+      },
+      "chamber_target_temperature": {
+        "name": "Chamber target"
+      },
+      "fan_model_speed": {
+        "name": "Model fan"
+      },
+      "fan_auxiliary_speed": {
+        "name": "Auxiliary fan"
+      },
+      "position_x": {
+        "name": "Position X"
+      },
+      "position_y": {
+        "name": "Position Y"
+      },
+      "position_z": {
+        "name": "Position Z"
+      },
+      "speed_factor": {
+        "name": "Speed factor"
+      },
+      "flow_factor": {
+        "name": "Flow factor"
+      },
+      "protocol": {
+        "name": "Protocol"
+      },
+      "firmware": {
+        "name": "Firmware"
+      },
+      "model": {
+        "name": "Model"
+      },
+      "serial": {
+        "name": "Serial number"
+      },
+      "ip_address": {
+        "name": "IP address"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      },
+      "active_job": {
+        "name": "Active job"
+      }
+    },
+    "button": {
+      "pause": {
+        "name": "Pause"
+      },
+      "resume": {
+        "name": "Resume"
+      },
+      "stop": {
+        "name": "Stop"
+      },
+      "home": {
+        "name": "Home"
+      }
+    },
+    "number": {
+      "nozzle_target": {
+        "name": "Nozzle target"
+      },
+      "bed_target": {
+        "name": "Bed target"
+      },
+      "chamber_target": {
+        "name": "Chamber target"
+      },
+      "speed_factor": {
+        "name": "Speed factor"
+      },
+      "flow_factor": {
+        "name": "Flow factor"
+      },
+      "fan_model_speed": {
+        "name": "Model fan"
+      },
+      "fan_auxiliary_speed": {
+        "name": "Auxiliary fan"
+      },
+      "fan_chamber_speed": {
+        "name": "Chamber fan"
+      }
+    },
+    "switch": {
+      "chamber_light": {
+        "name": "Chamber light"
+      }
+    },
+    "camera": {
+      "camera": {
+        "name": "Camera"
+      }
+    }
+  },
+  "services": {
+    "send_command": {
+      "name": "Send a command",
+      "description": "Send one normalised command to a printer, going through the same checks as a dashboard button.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "The printer to command."
+        },
+        "command": {
+          "name": "Command",
+          "description": "Which command to send."
+        },
+        "data": {
+          "name": "Parameters",
+          "description": "Parameters for the command."
+        }
+      }
+    },
+    "upload_file": {
+      "name": "Upload a file",
+      "description": "Upload a G-code file to a printer's storage.",
+      "fields": {
+        "entry_id": {
+          "name": "Printer",
+          "description": "The printer to upload to."
+        },
+        "filename": {
+          "name": "File name",
+          "description": "Name to store the file under."
+        },
+        "data": {
+          "name": "Contents",
+          "description": "The file contents, base64 encoded."
+        }
+      }
+    }
+  }
+}
