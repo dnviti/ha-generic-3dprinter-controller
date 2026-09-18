@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+**Fixed**
+
+* **A printer that was switched off and back on reconnects on its own.** It did
+  not before: the entry had to be reloaded by hand. Reading a printer is now what
+  reconnects to it. Before, a read only consulted the last status the adapter had
+  cached and reported "offline" without ever trying to reach the printer again, so
+  the connection was never re-established however long the printer had been back.
+* The adapter treated a socket object that was present but closed as a live
+  connection, which made its own reconnect a silent no-op even when something did
+  call it.
+* An unanswered request now drops the socket instead of leaving it in place, so the
+  next attempt reconnects rather than sending into a dead connection for ever.
+* A poll that cannot reach the printer returns an offline snapshot instead of
+  raising. A printer that is switched off is an expected state, not an error, and
+  raising left the entities unavailable with no reading of why.
+
+**Added**
+
+* Five reconnect tests that power the printer off and on again against the real
+  coordinator and adapter, including a long outage, a failed command while the
+  printer is off, and a check that recovery clears the stale error rather than only
+  flipping the connected flag.
+
+**Notes**
+
+* Verified on a live Elegoo Centauri Carbon: 21 of 21 adapter checks and 39
+  distinct camera frames in 4 seconds, about 10 frames per second.
+
 ## 0.2.0
 
 **Fixed**

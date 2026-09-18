@@ -384,9 +384,16 @@ class SdcpProtocol(Protocol):
     # --------------------------------------------------------------- lifecycle
 
     async def async_setup(self) -> None:
-        """Open the control socket and request the machine attributes once."""
-        if self._ws is not None and not self._ws.closed:
-            return
+        """Open the control socket and request the machine attributes once.
+
+        Idempotent for a healthy socket, and a full reconnect for a dead one. The
+        distinction matters: when a printer loses power its socket object survives
+        with ``closed`` set, so treating a present socket as a live one makes every
+        later reconnect a silent no-op and the integration sticks at offline until
+        somebody reloads it by hand.
+        """
+        if not self._connected:
+            await self._reset_socket()
 
         self._attributes_event.clear()
         try:
@@ -398,6 +405,7 @@ class SdcpProtocol(Protocol):
                 max_msg_size=16 * 1024 * 1024,
             )
         except aiohttp.WSServerHandshakeError as err:
+            self._ws = None
             if err.status == 500:
                 raise UnreachableError(
                     "the printer refused the connection. It allows five SDCP clients "
@@ -407,8 +415,10 @@ class SdcpProtocol(Protocol):
                 f"the printer refused the WebSocket handshake with HTTP {err.status}"
             ) from err
         except aiohttp.ClientError as err:
+            self._ws = None
             raise UnreachableError(f"cannot reach {self.config.redacted_url}: {err}") from err
         except TimeoutError as err:
+            self._ws = None
             raise UnreachableError(f"timeout contacting {self.config.redacted_url}") from err
 
         self._reader = asyncio.create_task(self._async_read_frames())
@@ -424,6 +434,40 @@ class SdcpProtocol(Protocol):
             self._mainboard_id or "(unknown)",
             self._attributes.get("FirmwareVersion"),
         )
+
+    @property
+    def _connected(self) -> bool:
+        """Return ``True`` only while a live socket and a live reader are both held."""
+        if self._ws is None or self._ws.closed:
+            return False
+        return self._reader is not None and not self._reader.done()
+
+    async def _reset_socket(self) -> None:
+        """Drop a dead socket, its reader and any request waiting on it.
+
+        The reader task is not cancelled: it has already finished, or it will finish
+        on its own the moment the socket dies, and cancelling it from here would
+        suppress the ``finally`` that fails the pending requests and clears the
+        reference. Yielding once lets it run that cleanup before a new socket is
+        opened.
+        """
+        reader = self._reader
+        if reader is not None and not reader.done():
+            reader.cancel()
+            with suppress(asyncio.CancelledError):
+                await reader
+            return
+
+        ws, self._ws = self._ws, None
+        if ws is not None and not ws.closed:
+            with suppress(aiohttp.ClientError, ConnectionResetError):
+                await ws.close()
+
+        self._fail_pending(UnreachableError("the SDCP socket is not open"))
+        self._reader = None
+
+        # Give the dead reader a turn so it can clear the reference itself.
+        await asyncio.sleep(0)
 
     async def async_teardown(self) -> None:
         """Close the socket and stop the reader. Idempotent."""
@@ -534,11 +578,16 @@ class SdcpProtocol(Protocol):
         *,
         timeout: float = ACK_TIMEOUT,
     ) -> Mapping[str, Any] | None:
-        """Send one request and wait for its acknowledgement frame."""
-        if self._ws is None or self._ws.closed:
+        """Send one request and wait for its acknowledgement frame.
+
+        The socket is health-checked before every request rather than only when it is
+        missing, because a printer that has been switched off leaves a socket object
+        behind whose ``closed`` flag is the only sign that it is gone.
+        """
+        if not self._connected:
             await self.async_setup()
         ws = self._ws
-        if ws is None:
+        if ws is None or ws.closed:
             raise UnreachableError("the SDCP socket is not open")
 
         request_id, frame = build_frame(self._mainboard_id, cmd, data)
@@ -558,9 +607,19 @@ class SdcpProtocol(Protocol):
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
             self._pending.pop(request_id, None)
+            # An unanswered request means the socket is no longer usable, even though
+            # it still looks open. Drop it so the next attempt reconnects instead of
+            # sending into the void forever.
+            self._health_check()
             raise ProtocolError(
                 f"the printer did not answer SDCP command {cmd} within {timeout:g}s"
             ) from None
+
+    def _health_check(self) -> None:
+        """Forget the socket when its reader has stopped or a request timed out."""
+        if self._reader is not None and self._reader.done():
+            self._ws = None
+            self._reader = None
 
     async def _async_send_checked(self, name: str, data: Mapping[str, Any]) -> None:
         """Send a command and raise when the printer refuses it."""
@@ -576,12 +635,21 @@ class SdcpProtocol(Protocol):
     # ------------------------------------------------------------------- read
 
     async def async_read(self) -> PrinterSnapshot:
-        """Return one snapshot, requesting status when no push has arrived.
+        """Return one snapshot, reconnecting when the session is gone.
 
-        The printer's push scheduler is documented as wedging on some firmware
-        while a one-shot request keeps working, so the poll path is the reliable
-        one and the push is the optimisation.
+        Connecting is part of reading, not something the caller has to remember. A
+        printer that has been switched off leaves a closed socket behind and its last
+        status still cached, so a read that only consulted that cache would report
+        "offline" for ever and never try to reach the printer again. That is exactly
+        the state a user has to reload the config entry to escape.
+
+        The printer's push scheduler is documented as wedging on some firmware while
+        a one-shot request keeps working, so the poll path is the reliable one and
+        the push is the optimisation.
         """
+        if not self._connected:
+            await self.async_setup()
+
         if not self._status:
             self._status_event.clear()
             await self._async_request(COMMAND["status"])
@@ -600,7 +668,7 @@ class SdcpProtocol(Protocol):
         light_known = parsed["chamber_light"] is not None
         return PrinterSnapshot(
             protocol=ProtocolId.SDCP_CC1,
-            connected=self._ws is not None and not self._ws.closed,
+            connected=self._connected,
             capabilities=self.capabilities,
             print_state=state_for(parsed["print_status"], flags),
             progress=_percent(parsed["progress"]),

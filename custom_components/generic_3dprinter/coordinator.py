@@ -15,7 +15,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
 from .models import FileEntry, PrinterSnapshot
@@ -52,33 +52,56 @@ class PrinterCoordinator(DataUpdateCoordinator[PrinterSnapshot]):
         self.runtime = runtime
 
     async def _async_update_data(self) -> PrinterSnapshot:
-        """Read one snapshot, reconnecting once when the printer dropped the session."""
+        """Read one snapshot, reconnecting when the printer dropped the session.
+
+        Every failure returns an offline snapshot rather than raising. A printer that
+        has been switched off is an expected state, not an error condition, and
+        raising here would leave the entities unavailable with no reading of why.
+        """
         runtime = self.runtime
         try:
             snapshot = await runtime.adapter.async_read()
         except AuthError as err:
-            raise UpdateFailed(f"authentication failed: {err}") from err
+            runtime.last_error = f"authentication failed: {err}"
+            self.async_set_update_error(err)
+            return self._offline_snapshot(runtime.last_error)
         except UnreachableError as err:
             _LOGGER.debug("%s: read failed (%s), reconnecting", runtime.config.name, err)
-            try:
-                await runtime.adapter.async_teardown()
-                await runtime.adapter.async_setup()
-                snapshot = await runtime.adapter.async_read()
-            except (AuthError, ProtocolError) as retry_err:
-                runtime.last_error = str(retry_err)
-                self.async_set_update_error(retry_err)
-                return self._offline_snapshot(retry_err)
+            return await self._async_reconnect(err)
         except ProtocolError as err:
             runtime.last_error = str(err)
             self.async_set_update_error(err)
-            return self._offline_snapshot(err)
+            return self._offline_snapshot(str(err))
 
+        return self._store(snapshot)
+
+    async def _async_reconnect(self, cause: Exception) -> PrinterSnapshot:
+        """Rebuild the session once and read again, reporting offline if it fails.
+
+        The cause is reported on the snapshot, so "offline" says whether the printer
+        is unreachable or whether it answered with something unusable. A printer that
+        is simply off must not leave the coordinator raising forever.
+        """
+        runtime = self.runtime
+        try:
+            await runtime.adapter.async_teardown()
+            await runtime.adapter.async_setup()
+            snapshot = await runtime.adapter.async_read()
+        except (AuthError, ProtocolError) as err:
+            runtime.last_error = str(err)
+            self.async_set_update_error(err)
+            return self._offline_snapshot(str(err))
+        return self._store(snapshot)
+
+    def _store(self, snapshot: PrinterSnapshot) -> PrinterSnapshot:
+        """Record a good reading and clear the previous error."""
+        runtime = self.runtime
         runtime.snapshot = snapshot
         runtime.last_error = None
         runtime.last_seen = self.hass.loop.time()
         return snapshot
 
-    def _offline_snapshot(self, error: Exception) -> PrinterSnapshot:
+    def _offline_snapshot(self, error: str) -> PrinterSnapshot:
         """Return a snapshot that says "offline" without inventing any reading."""
         runtime = self.runtime
         runtime.snapshot = PrinterSnapshot(
@@ -88,7 +111,7 @@ class PrinterCoordinator(DataUpdateCoordinator[PrinterSnapshot]):
             model=runtime.snapshot.model,
             firmware=runtime.snapshot.firmware,
             serial=runtime.snapshot.serial,
-            errors=(str(error),),
+            errors=(error,),
         )
         return runtime.snapshot
 
