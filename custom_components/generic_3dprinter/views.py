@@ -28,7 +28,7 @@ import logging
 from contextlib import aclosing, suppress
 from http import HTTPStatus
 from typing import Final
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from aiohttp import hdrs, web
 from homeassistant.components.http import HomeAssistantView
@@ -37,11 +37,14 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     API_BASE,
+    DATA_COORDINATORS,
     RESOURCE_CAMERA,
     RESOURCE_SNAPSHOT,
     RESOURCE_STATUS,
     RESOURCE_WEB,
+    Capability,
 )
+from .coordinator import PrinterError
 from .proxy import WebProxyError, scrub_response_headers
 from .runtime import get_runtime
 from .security import InvalidToken, MediaToken
@@ -263,11 +266,97 @@ class WebProxyView(ProxyView):
         )
 
 
+#: The largest file the upload endpoint accepts. Every adapter holds the whole
+#: file in memory to compute its checksum, so a ceiling is a memory bound as much
+#: as a sanity bound. A sliced model is rarely a tenth of this.
+MAX_UPLOAD_BYTES: Final = 256 * 1024 * 1024
+
+#: File types a printer stores as a job. Anything else is refused at the door.
+UPLOAD_SUFFIXES: Final = (".gcode", ".gco", ".g", ".bgcode")
+
+
+def upload_name(raw: str | None) -> str:
+    """Return a safe file name for an upload, or raise ``HTTPBadRequest``.
+
+    The name travels to the printer as a header or a form field, so only its last
+    path segment is kept and control characters are refused outright. A client may
+    percent-encode the name in its multipart header, and the separators hidden that
+    way are removed too.
+    """
+    name = unquote(raw or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name or name in (".", "..") or any(ord(char) < 32 for char in name):
+        raise web.HTTPBadRequest(text="the file needs a name")
+    if not name.lower().endswith(UPLOAD_SUFFIXES):
+        raise web.HTTPBadRequest(
+            text=f"only {', '.join(UPLOAD_SUFFIXES)} files can be sent to a printer"
+        )
+    if len(name) > 200:
+        raise web.HTTPBadRequest(text="the file name is too long")
+    return name
+
+
+class UploadView(HomeAssistantView):
+    """Receive a G-code file from the card and store it on the printer.
+
+    Unlike the proxy views this one is called with ``fetch``, which carries the
+    user's own credentials, so Home Assistant authenticates it as it does any API
+    call. The body is multipart with one ``file`` field and is read in chunks, so
+    Home Assistant's request size limit, meant for JSON bodies, does not apply.
+    """
+
+    url = f"{API_BASE}/{{entry_id}}/upload"
+    name = "api:generic_3dprinter:upload"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Store the Home Assistant instance."""
+        self.hass = hass
+
+    async def post(self, request: web.Request, entry_id: str) -> web.Response:
+        """Store the uploaded file and return its entry."""
+        runtime = get_runtime(self.hass, entry_id)
+        coordinator = self.hass.data.get(DATA_COORDINATORS, {}).get(entry_id)
+        if runtime is None or coordinator is None:
+            raise web.HTTPNotFound
+        if Capability.FILE_UPLOAD not in runtime.capabilities:
+            return web.json_response(
+                {"error": "this printer does not accept uploads"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        try:
+            reader = await request.multipart()
+        except (AssertionError, ValueError) as err:
+            raise web.HTTPBadRequest(text="expected a multipart upload") from err
+        part = await reader.next()
+        while part is not None and getattr(part, "name", None) != "file":
+            part = await reader.next()
+        if part is None or not hasattr(part, "read_chunk"):
+            raise web.HTTPBadRequest(text="the upload has no file field")
+
+        name = upload_name(part.filename)
+        body = bytearray()
+        while chunk := await part.read_chunk(STREAM_CHUNK):
+            body.extend(chunk)
+            if len(body) > MAX_UPLOAD_BYTES:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=MAX_UPLOAD_BYTES, actual_size=len(body)
+                )
+        if not body:
+            raise web.HTTPBadRequest(text="the file is empty")
+
+        try:
+            entry = await coordinator.async_upload_file(name, bytes(body))
+        except PrinterError as err:
+            return web.json_response({"error": str(err)}, status=HTTPStatus.BAD_GATEWAY)
+        return web.json_response({"file": entry.as_dict()})
+
+
 VIEWS: Final = (
     CameraStreamView,
     SnapshotView,
     StatusView,
     WebProxyView,
+    UploadView,
 )
 
 

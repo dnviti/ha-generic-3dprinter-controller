@@ -144,6 +144,90 @@ async def test_the_first_centauri_is_still_reached_through_the_family(
     assert "serial" not in {str(key) for key in result["data_schema"].schema}
 
 
+def cc2_entry(hass: HomeAssistant, printer: FakeCC2Printer) -> MockConfigEntry:
+    """Add an entry for the fake printer, not yet set up."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Fake CC2",
+        data={
+            "name": "Fake CC2",
+            "protocol": "elegoo_cc2",
+            "host": "127.0.0.1",
+            "port": printer.port,
+            "camera_port": printer.camera_port,
+            "serial": SERIAL,
+            "scan_interval": 5,
+        },
+        unique_id=f"elegoo_cc2:127.0.0.1:{printer.port}",
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+async def test_the_card_api(
+    hass: HomeAssistant,
+    hass_ws_client,
+    hass_client,
+    cc2_printer: FakeCC2Printer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cc2, "UPLOAD_PORT", cc2_printer.upload_port)
+    entry = cc2_entry(hass, cc2_printer)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    websocket = await hass_ws_client(hass)
+    await websocket.send_json({"id": 1, "type": "generic_3dprinter/list"})
+    listed = await websocket.receive_json()
+    assert listed["success"], listed
+    (printer,) = listed["result"]["printers"]
+    assert printer["protocol"] == "elegoo_cc2"
+    # The state sensor is found by its real unique id.
+    assert printer["entity_id"] and printer["entity_id"].startswith("sensor.")
+
+    await websocket.send_json({"id": 2, "type": "generic_3dprinter/files", "entry_id": entry.entry_id})
+    files = await websocket.receive_json()
+    assert [item["name"] for item in files["result"]["files"]] == ["benchy.gcode", "cube.gcode"]
+
+    await websocket.send_json(
+        {
+            "id": 3,
+            "type": "generic_3dprinter/send",
+            "entry_id": entry.entry_id,
+            "command": "set_fan_speed",
+            "data": {"value": 50, "channel": "model"},
+        }
+    )
+    assert (await websocket.receive_json())["success"]
+    assert cc2_printer.params_of(1030) == [{"fan": 128}]
+
+    import aiohttp
+
+    client = await hass_client()
+    url = f"/api/generic_3dprinter/{entry.entry_id}/upload"
+
+    form = aiohttp.FormData()
+    form.add_field("file", b"G28\nG1 X10\n", filename="part.gcode")
+    response = await client.post(url, data=form)
+    assert response.status == 200, await response.text()
+    assert (await response.json())["file"]["name"] == "part.gcode"
+    assert cc2_printer.uploads[-1]["body"] == b"G28\nG1 X10\n"
+
+    form = aiohttp.FormData()
+    form.add_field("file", b"not a job", filename="notes.txt")
+    response = await client.post(url, data=form)
+    assert response.status == 400
+
+    form = aiohttp.FormData()
+    form.add_field("file", b"G28\n", filename="../../etc/part.gcode")
+    response = await client.post(url, data=form)
+    assert response.status == 200
+    assert cc2_printer.uploads[-1]["headers"]["X-File-Name"] == "part.gcode"
+
+    response = await client.post("/api/generic_3dprinter/nope/upload", data=b"")
+    assert response.status == 404
+
+
 async def test_a_centauri_carbon_2_entry(
     hass: HomeAssistant, cc2_printer: FakeCC2Printer
 ) -> None:

@@ -640,7 +640,8 @@ class SdcpProtocol(Protocol):
         # the whole of it.
         remaining = max(total - elapsed, 0.0) if elapsed is not None and total is not None else None
 
-        light_known = parsed["chamber_light"] is not None
+        # ``lights`` holds the lights that are on, so a known-but-off light is absent.
+        light_on = bool(parsed["chamber_light"])
         return PrinterSnapshot(
             protocol=ProtocolId.SDCP_CC1,
             connected=self._connected,
@@ -672,7 +673,7 @@ class SdcpProtocol(Protocol):
                 chamber=_percent(parsed["fan_chamber"]),
             ),
             position=parsed["position"],
-            lights=frozenset({LightChannel.CHAMBER}) if light_known else frozenset(),
+            lights=frozenset({LightChannel.CHAMBER}) if light_on else frozenset(),
             camera=self._attributes.get("CameraStatus") == 1,
             model=str(self._attributes.get("MachineName") or "") or None,
             firmware=str(self._attributes.get("FirmwareVersion") or "") or None,

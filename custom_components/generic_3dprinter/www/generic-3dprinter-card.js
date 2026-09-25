@@ -1,26 +1,52 @@
 /**
  * Generic 3D Printer Controller card.
  *
- * Renders one printer, or a fleet, from the integration's own WebSocket API. The
- * card never learns which protocol a printer speaks: it reads the capability array
- * the backend reports and draws a control per capability present, so a printer that
- * cannot pause simply has no pause button and a printer with no camera has no
- * camera pane.
+ * One card that drives a whole printer: its camera, its job, its heaters, fans and
+ * speed, a joystick for the head, its stored files, and the smart plug it is
+ * powered from. It reads everything from the integration's own WebSocket API and
+ * never learns which protocol a printer speaks: it reads the capability array the
+ * backend reports and draws a control per capability present, so a printer that
+ * cannot pause has no pause button and a printer that cannot jog has no joystick.
+ *
+ * The DOM of each printer is built once and then updated in place. That is what
+ * keeps a live camera stream from being restarted on every poll, and what keeps a
+ * value the user is typing from being overwritten by the next reading.
  *
  * Ships with the integration, so `custom:generic-3dprinter-card` is available as
  * soon as the integration is installed.
  */
 
-const CARD_VERSION = "0.3.0";
+const CARD_VERSION = "0.4.0";
 
 const WS_LIST = "generic_3dprinter/list";
 const WS_DESCRIBE = "generic_3dprinter/describe";
 const WS_SEND = "generic_3dprinter/send";
+const WS_FILES = "generic_3dprinter/files";
+const API_BASE = "/api/generic_3dprinter";
 
-/* How often signed URLs and the printer snapshot are refreshed. Signed URLs live
- * for six hours, so this is about keeping the displayed state honest, not about
- * staying ahead of an expiry. */
+/* How often the printer is read. */
 const REFRESH_MS = 5000;
+
+/* Signed URLs live for six hours. The camera keeps the URL it started with, so its
+ * one upstream connection is never torn down by a poll, and it is re-signed well
+ * before the old signature runs out. */
+const CAMERA_RESIGN_MS = 60 * 60 * 1000;
+
+/* After a camera that failed outright, how long to wait before trying again. */
+const CAMERA_RETRY_MS = 30 * 1000;
+
+const DEFAULT_JOG_STEPS = [0.1, 1, 10, 50];
+const DEFAULT_PRESETS = [
+  { name: "PLA", hotend: 210, bed: 60 },
+  { name: "PETG", hotend: 240, bed: 80 },
+  { name: "ABS", hotend: 255, bed: 100 },
+];
+
+/* A nozzle hotter than this still needs its fan, which the plug would cut. */
+const HOT_NOZZLE = 50;
+
+const TEMPERATURE_MAX = 350;
+const TEMPERATURE_NUDGE = 5;
 
 const STATE_COLORS = {
   idle: "var(--state-inactive-color, #9e9e9e)",
@@ -31,6 +57,7 @@ const STATE_COLORS = {
   cancelled: "var(--state-inactive-color, #9e9e9e)",
   error: "var(--error-color, #f44336)",
   unknown: "var(--disabled-text-color, #bdbdbd)",
+  off: "var(--disabled-text-color, #bdbdbd)",
 };
 
 const STATE_LABELS = {
@@ -42,7 +69,56 @@ const STATE_LABELS = {
   cancelled: "Cancelled",
   error: "Error",
   unknown: "Unknown",
+  off: "Off",
 };
+
+/* A job is running or held: the head must not be moved and a new print not started. */
+const ACTIVE_STATES = new Set(["printing", "paused", "preparing"]);
+
+const HEATERS = [
+  { key: "hotend", label: "Nozzle", command: "set_hotend_temp" },
+  { key: "bed", label: "Bed", command: "set_bed_temp" },
+  { key: "chamber", label: "Chamber", command: "set_chamber_temp" },
+];
+
+/* Fans the card can set, and fans it can only report. */
+const SETTABLE_FANS = [
+  { key: "model", label: "Part cooling" },
+  { key: "auxiliary", label: "Auxiliary" },
+  { key: "chamber", label: "Chamber" },
+];
+const REPORTED_FANS = [
+  { key: "hotend", label: "Hotend" },
+  { key: "controller", label: "Board" },
+];
+
+/* Material Design Icons, Apache 2.0. */
+const ICONS = {
+  power:
+    "M16.56,5.44L15.11,6.89C16.84,7.94 18,9.83 18,12A6,6 0 0,1 12,18A6,6 0 0,1 6,12C6,9.83 7.16,7.94 8.88,6.88L7.44,5.44C5.36,6.88 4,9.28 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12C20,9.28 18.64,6.88 16.56,5.44M13,3H11V13H13",
+  light:
+    "M12,2A7,7 0 0,0 5,9C5,11.38 6.19,13.47 8,14.74V17A1,1 0 0,0 9,18H15A1,1 0 0,0 16,17V14.74C17.81,13.47 19,11.38 19,9A7,7 0 0,0 12,2M9,21A1,1 0 0,0 10,22H14A1,1 0 0,0 15,21V20H9V21Z",
+  pause: "M14,19H18V5H14M6,19H10V5H6V19Z",
+  play: "M8,5.14V19.14L19,12.14L8,5.14Z",
+  stop: "M18,18H6V6H18V18Z",
+  home: "M10,20V14H14V20H19V12H22L12,3L2,12H5V20H10Z",
+  up: "M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z",
+  down: "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z",
+  left: "M15.41,16.58L10.83,12L15.41,7.41L14,6L8,12L14,18L15.41,16.58Z",
+  right: "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z",
+  upload: "M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z",
+  delete: "M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z",
+  refresh:
+    "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z",
+  fullscreen: "M5,5H10V7H7V10H5V5M14,5H19V10H17V7H14V5M17,14H19V19H14V17H17V14M10,17V19H5V14H7V17H10Z",
+  thermometer:
+    "M15 13V5A3 3 0 0 0 9 5V13A5 5 0 1 0 15 13M12 4A1 1 0 0 1 13 5V8H11V5A1 1 0 0 1 12 4Z",
+  fan: "M12,11A1,1 0 0,0 11,12A1,1 0 0,0 12,13A1,1 0 0,0 13,12A1,1 0 0,0 12,11M12.5,2C17,2 17.11,5.57 14.75,6.75C13.76,7.24 13.32,8.29 13.13,9.22C13.61,9.42 14.03,9.73 14.35,10.13C18.05,8.13 22.03,8.92 22.03,12.5C22.03,17 18.46,17.1 17.28,14.73C16.78,13.74 15.72,13.3 14.79,13.11C14.59,13.59 14.28,14 13.88,14.34C15.87,18.03 15.08,22 11.5,22C7,22 6.91,18.42 9.27,17.24C10.25,16.75 10.69,15.71 10.89,14.79C10.4,14.59 9.97,14.27 9.65,13.87C5.96,15.85 2,15.07 2,11.5C2,7 5.56,6.89 6.74,9.26C7.24,10.25 8.29,10.68 9.22,10.87C9.41,10.39 9.73,9.97 10.14,9.65C8.15,5.96 8.94,2 12.5,2Z",
+  file: "M13,9V3.5L18.5,9M6,2C4.89,2 4,2.89 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6Z",
+  open: "M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z",
+};
+
+// ------------------------------------------------------------------ helpers
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -51,8 +127,36 @@ const el = (tag, className, text) => {
   return node;
 };
 
+const icon = (name, size = 20) => {
+  const ns = "http://www.w3.org/2000/svg";
+  const node = document.createElementNS(ns, "svg");
+  node.setAttribute("viewBox", "0 0 24 24");
+  node.setAttribute("width", String(size));
+  node.setAttribute("height", String(size));
+  node.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", ICONS[name]);
+  path.setAttribute("fill", "currentColor");
+  node.appendChild(path);
+  return node;
+};
+
+/** A button with an icon, a label, and the command it sends as a data attribute. */
+const button = (className, label, iconName, command) => {
+  const node = el("button", className);
+  node.type = "button";
+  if (iconName) node.appendChild(icon(iconName, 18));
+  if (label) node.appendChild(el("span", "label", label));
+  node.title = label || "";
+  node.setAttribute("aria-label", label || iconName || "");
+  if (command) node.dataset.command = command;
+  return node;
+};
+
 const asNumber = (value) =>
-  value === null || value === undefined || value === "" ? null : Number(value);
+  value === null || value === undefined || value === "" || Number.isNaN(Number(value))
+    ? null
+    : Number(value);
 
 const formatTemperature = (value) => {
   const number = asNumber(value);
@@ -70,6 +174,15 @@ const formatDuration = (seconds) => {
   return `${whole}s`;
 };
 
+const formatEta = (remaining, now = new Date()) => {
+  const seconds = asNumber(remaining);
+  if (seconds === null || seconds < 0) return null;
+  const at = new Date(now.getTime() + seconds * 1000);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (at.toDateString() === now.toDateString()) return time;
+  return `${at.toLocaleDateString([], { weekday: "short" })} ${time}`;
+};
+
 const formatBytes = (value) => {
   const bytes = asNumber(value);
   if (bytes === null) return "";
@@ -83,6 +196,950 @@ const formatBytes = (value) => {
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 };
 
+const formatStep = (step) => (step < 1 ? String(step) : String(Math.round(step)));
+
+const baseName = (path) => String(path || "").split("/").pop();
+
+/** Return true when an input is being edited, so a reading does not overwrite it. */
+const editing = (input) =>
+  input.dataset.dirty === "1" || input.getRootNode().activeElement === input;
+
+// ------------------------------------------------------------------- views
+
+/**
+ * The DOM of one printer, built once and then updated in place.
+ *
+ * Interactive elements (inputs, sliders, buttons) are created once and have their
+ * state patched. Read-only fragments (stats, temperature tiles) are rebuilt on
+ * every update, because they hold nothing the user could lose.
+ */
+class PrinterView {
+  constructor(card, entryId, compact) {
+    this.card = card;
+    this.entryId = entryId;
+    this.compact = compact;
+    this.tab = "status";
+    this.description = {};
+    this.snapshot = {};
+    this.capabilities = [];
+    this.files = null;
+    this.filesError = null;
+    this.filesLoading = false;
+    this.uploading = null;
+    const steps = card.jogSteps();
+    this.jogStep = steps.includes(10) ? 10 : steps[Math.min(1, steps.length - 1)];
+    this.camera = { src: null, mode: null, signedAt: 0, failedAt: 0, degradedAt: 0, suspended: false };
+    this.root = this._build();
+  }
+
+  // ---------------------------------------------------------------- build
+
+  _build() {
+    const root = el("div", "printer");
+    root.dataset.entryId = this.entryId;
+
+    const header = el("div", "printer-header");
+    this.dot = el("span", "dot");
+    header.appendChild(this.dot);
+    const names = el("div", "names");
+    this.nameEl = el("div", "name");
+    this.subtitleEl = el("div", "subtitle");
+    names.append(this.nameEl, this.subtitleEl);
+    header.appendChild(names);
+    this.stateEl = el("div", "state");
+    header.appendChild(this.stateEl);
+
+    this.lightButton = button("icon-btn light-toggle", "Light", "light", "set_light");
+    this.lightButton.addEventListener("click", () => {
+      const on = (this.snapshot.lights || []).includes("chamber");
+      this.card.send(this.entryId, "set_light", { on: !on, channel: "chamber" });
+    });
+    this.powerButton = button("icon-btn power-toggle", "Power", "power");
+    this.powerButton.addEventListener("click", () => this.card.togglePower(this));
+    header.append(this.lightButton, this.powerButton);
+    root.appendChild(header);
+
+    this.warningEl = el("div", "warning");
+    this.errorsEl = el("div", "errors");
+    root.append(this.warningEl, this.errorsEl);
+
+    this.body = el("div", "body");
+    this.cameraColumn = this._buildCamera();
+    this.body.appendChild(this.cameraColumn);
+
+    const main = el("div", "main");
+    if (!this.compact) {
+      this.tabBar = el("div", "tabs");
+      this.tabButtons = {};
+      for (const [key, label] of [
+        ["status", "Status"],
+        ["controls", "Controls"],
+        ["files", "Files"],
+      ]) {
+        const tab = el("button", "tab", label);
+        tab.type = "button";
+        tab.dataset.tab = key;
+        tab.addEventListener("click", () => this.selectTab(key));
+        this.tabButtons[key] = tab;
+        this.tabBar.appendChild(tab);
+      }
+      main.appendChild(this.tabBar);
+    }
+    this.panels = {
+      status: this._buildStatus(),
+      controls: this.compact ? null : this._buildControls(),
+      files: this.compact ? null : this._buildFiles(),
+    };
+    for (const panel of Object.values(this.panels)) if (panel) main.appendChild(panel);
+    this.body.appendChild(main);
+    root.appendChild(this.body);
+
+    this.footer = el("div", "footer");
+    root.appendChild(this.footer);
+    this.selectTab("status");
+    return root;
+  }
+
+  _buildCamera() {
+    const column = el("div", "camera");
+    this.cameraFrame = el("div", "camera-frame");
+    this.cameraPlaceholder = el("div", "camera-error", "Camera unavailable");
+    this.cameraOverlay = el("div", "camera-overlay");
+    this.fullscreenButton = button("icon-btn camera-fullscreen", "Full screen", "fullscreen");
+    this.fullscreenButton.addEventListener("click", () => {
+      const target = this.image || this.cameraFrame;
+      if (target.requestFullscreen) target.requestFullscreen().catch(() => {});
+    });
+    this.cameraFrame.append(this.cameraPlaceholder, this.cameraOverlay, this.fullscreenButton);
+    column.appendChild(this.cameraFrame);
+    return column;
+  }
+
+  _buildStatus() {
+    const panel = el("div", "panel panel-status");
+    this.progressBlock = el("div", "progress-block");
+    const track = el("div", "progress-track");
+    this.progressFill = el("div", "progress-fill");
+    track.appendChild(this.progressFill);
+    this.progressLabel = el("div", "progress-label");
+    this.progressBlock.append(track, this.progressLabel);
+    this.statsEl = el("div", "stats");
+    this.jobEl = el("div", "job");
+    this.tempsEl = el("div", "temps");
+    this.fansReadout = el("div", "fans-readout");
+
+    this.jobControls = el("div", "controls");
+    this.pauseButton = button("ctl primary", "Pause", "pause", "pause");
+    this.pauseButton.addEventListener("click", () => this.card.send(this.entryId, "pause"));
+    this.resumeButton = button("ctl primary", "Resume", "play", "resume");
+    this.resumeButton.addEventListener("click", () => this.card.send(this.entryId, "resume"));
+    this.stopButton = button("ctl danger", "Stop", "stop", "stop");
+    this.stopButton.addEventListener("click", () => {
+      if (!this.card.confirm("Stop the print? It cannot be resumed afterwards.")) return;
+      this.card.send(this.entryId, "stop");
+    });
+    this.jobControls.append(this.pauseButton, this.resumeButton, this.stopButton);
+
+    panel.append(
+      this.progressBlock,
+      this.statsEl,
+      this.jobEl,
+      this.tempsEl,
+      this.fansReadout,
+      this.jobControls,
+    );
+    return panel;
+  }
+
+  _buildControls() {
+    const panel = el("div", "panel panel-controls");
+
+    // Heaters.
+    this.heaterSection = el("div", "section heaters");
+    this.heaterSection.appendChild(el("div", "section-title", "Temperatures"));
+    this.heaterRows = {};
+    for (const heater of HEATERS) {
+      const row = el("div", "heater");
+      row.dataset.heater = heater.key;
+      const label = el("div", "heater-label");
+      label.append(icon("thermometer", 16), el("span", "", heater.label));
+      const current = el("div", "heater-current");
+      const input = el("input", "heater-input");
+      input.type = "number";
+      input.min = "0";
+      input.max = String(TEMPERATURE_MAX);
+      input.step = "1";
+      input.inputMode = "numeric";
+      input.setAttribute("aria-label", `${heater.label} target`);
+      input.addEventListener("input", () => {
+        input.dataset.dirty = "1";
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") apply();
+      });
+      const nudge = (delta) => {
+        const value = asNumber(input.value) ?? asNumber(this.snapshot[heater.key]?.target) ?? 0;
+        input.value = String(Math.max(0, Math.min(TEMPERATURE_MAX, value + delta)));
+        input.dataset.dirty = "1";
+      };
+      const minus = button("mini", "−5", null);
+      minus.addEventListener("click", () => nudge(-TEMPERATURE_NUDGE));
+      const plus = button("mini", "+5", null);
+      plus.addEventListener("click", () => nudge(TEMPERATURE_NUDGE));
+      const set = button("mini accent heater-set", "Set", null, heater.command);
+      const apply = () => {
+        const value = asNumber(input.value);
+        if (value === null) return;
+        this.card
+          .send(this.entryId, heater.command, { value })
+          .finally(() => delete input.dataset.dirty);
+      };
+      set.addEventListener("click", apply);
+      const off = button("mini heater-off", "Off", null);
+      off.addEventListener("click", () => {
+        input.value = "0";
+        apply();
+      });
+      const controls = el("div", "heater-controls");
+      controls.append(minus, input, plus, set, off);
+      const name = el("div", "heater-name");
+      name.append(label, current);
+      row.append(name, controls);
+      this.heaterRows[heater.key] = { row, current, input, set };
+      this.heaterSection.appendChild(row);
+    }
+    this.presetRow = el("div", "presets");
+    for (const preset of this.card.presets()) {
+      const chip = button("chip preset", preset.name, null);
+      chip.title = `${preset.name}: nozzle ${preset.hotend} °C, bed ${preset.bed} °C`;
+      chip.addEventListener("click", () => this.applyPreset(preset));
+      this.presetRow.appendChild(chip);
+    }
+    const cool = button("chip cooldown", "Cool down", null);
+    cool.addEventListener("click", () => this.applyPreset({ name: "Cool down", hotend: 0, bed: 0, chamber: 0 }));
+    this.presetRow.appendChild(cool);
+    this.heaterSection.appendChild(this.presetRow);
+    panel.appendChild(this.heaterSection);
+
+    // Fans and speed.
+    this.fanSection = el("div", "section fans");
+    this.fanSection.appendChild(el("div", "section-title", "Fans and speed"));
+    this.fanSliders = {};
+    for (const fan of SETTABLE_FANS) {
+      const slider = this._slider(fan.label, "fan", 0, 100, 1, (value) =>
+        this.card.send(this.entryId, "set_fan_speed", { value, channel: fan.key }),
+      );
+      slider.row.dataset.fan = fan.key;
+      this.fanSliders[fan.key] = slider;
+      this.fanSection.appendChild(slider.row);
+    }
+    this.speedSlider = this._slider("Print speed", "speedometer", 10, 100, 5, (value) =>
+      this.card.send(this.entryId, "set_speed", { value }),
+    );
+    this.speedSlider.row.classList.add("speed");
+    this.fanSection.appendChild(this.speedSlider.row);
+    this.reportedFans = el("div", "reported-fans");
+    this.fanSection.appendChild(this.reportedFans);
+    panel.appendChild(this.fanSection);
+
+    // Motion.
+    this.motionSection = el("div", "section motion");
+    this.motionSection.appendChild(el("div", "section-title", "Motion"));
+    const motion = el("div", "motion-body");
+
+    this.joystick = el("div", "joystick");
+    this.joystick.tabIndex = 0;
+    this.joystick.setAttribute("role", "group");
+    this.joystick.setAttribute(
+      "aria-label",
+      "Move the head. Arrow keys move X and Y, Page Up and Page Down move Z.",
+    );
+    const jog = (axis, direction, iconName, className) => {
+      const node = button(`jog ${className}`, `${axis}${direction > 0 ? "+" : "−"}`, iconName, "jog");
+      node.dataset.axis = axis;
+      node.dataset.direction = String(direction);
+      node.addEventListener("click", () => this.jog(axis, direction));
+      return node;
+    };
+    this.jogButtons = [
+      jog("Y", 1, "up", "y-plus"),
+      jog("X", -1, "left", "x-minus"),
+      jog("X", 1, "right", "x-plus"),
+      jog("Y", -1, "down", "y-minus"),
+    ];
+    this.homeXY = button("jog home-center", "Home XY", "home", "home");
+    this.homeXY.dataset.axes = "XY";
+    this.homeXY.addEventListener("click", () => this.home("XY"));
+    this.joystick.append(...this.jogButtons, this.homeXY);
+    this.joystick.addEventListener("keydown", (event) => {
+      const keys = {
+        ArrowUp: ["Y", 1],
+        ArrowDown: ["Y", -1],
+        ArrowLeft: ["X", -1],
+        ArrowRight: ["X", 1],
+        PageUp: ["Z", 1],
+        PageDown: ["Z", -1],
+      };
+      const move = keys[event.key];
+      if (!move) return;
+      event.preventDefault();
+      this.jog(move[0], move[1]);
+    });
+
+    this.zColumn = el("div", "z-column");
+    const zUp = jog("Z", 1, "up", "z-plus");
+    const zDown = jog("Z", -1, "down", "z-minus");
+    this.homeZ = button("jog home-z", "Home Z", "home", "home");
+    this.homeZ.dataset.axes = "Z";
+    this.homeZ.addEventListener("click", () => this.home("Z"));
+    this.zColumn.append(zUp, this.homeZ, zDown);
+    this.jogButtons.push(zUp, zDown);
+
+    const pad = el("div", "pad");
+    pad.append(this.joystick, this.zColumn);
+    motion.appendChild(pad);
+
+    const side = el("div", "motion-side");
+    this.stepChips = el("div", "steps");
+    this.stepChips.appendChild(el("span", "steps-label", "Step (mm)"));
+    for (const step of this.card.jogSteps()) {
+      const chip = button("chip step", formatStep(step), null);
+      chip.dataset.step = String(step);
+      chip.addEventListener("click", () => {
+        this.jogStep = step;
+        this._paintSteps();
+      });
+      this.stepChips.appendChild(chip);
+    }
+    this.homeAll = button("ctl home-all", "Home all", "home", "home");
+    this.homeAll.dataset.axes = "XYZ";
+    this.homeAll.addEventListener("click", () => this.home("XYZ"));
+    this.positionEl = el("div", "position");
+    this.motionHint = el("div", "hint motion-hint");
+    side.append(this.stepChips, this.homeAll, this.positionEl, this.motionHint);
+    motion.appendChild(side);
+    this.motionSection.appendChild(motion);
+    panel.appendChild(this.motionSection);
+
+    this.noControls = el("div", "empty-panel", "This printer reports no settings it can be given.");
+    panel.appendChild(this.noControls);
+    this._paintSteps();
+    return panel;
+  }
+
+  _slider(label, iconName, min, max, step, onChange) {
+    const row = el("div", "slider-row");
+    const name = el("div", "slider-label");
+    name.append(icon(iconName in ICONS ? iconName : "fan", 16), el("span", "", label));
+    const input = el("input", "slider");
+    input.type = "range";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.setAttribute("aria-label", label);
+    const value = el("div", "slider-value");
+    input.addEventListener("input", () => {
+      input.dataset.dirty = "1";
+      value.textContent = `${input.value}%`;
+    });
+    input.addEventListener("change", () => {
+      const number = asNumber(input.value);
+      if (number === null) return;
+      Promise.resolve(onChange(number)).finally(() => delete input.dataset.dirty);
+    });
+    row.append(name, input, value);
+    return { row, input, value };
+  }
+
+  _buildFiles() {
+    const panel = el("div", "panel panel-files");
+    const toolbar = el("div", "files-toolbar");
+    this.refreshFiles = button("icon-btn files-refresh", "Refresh", "refresh");
+    this.refreshFiles.addEventListener("click", () => this.loadFiles());
+    this.uploadInput = el("input", "upload-input");
+    this.uploadInput.type = "file";
+    this.uploadInput.accept = ".gcode,.gco,.g,.bgcode";
+    this.uploadInput.hidden = true;
+    this.uploadInput.addEventListener("change", () => {
+      const file = this.uploadInput.files && this.uploadInput.files[0];
+      this.uploadInput.value = "";
+      if (file) this.upload(file);
+    });
+    this.uploadButton = button("ctl upload", "Upload", "upload");
+    this.uploadButton.addEventListener("click", () => this.uploadInput.click());
+    this.printAfterUpload = el("label", "print-after");
+    this.printAfterInput = el("input");
+    this.printAfterInput.type = "checkbox";
+    this.printAfterUpload.append(this.printAfterInput, el("span", "", "Print when uploaded"));
+    toolbar.append(this.uploadButton, this.uploadInput, this.printAfterUpload, el("span", "spacer"), this.refreshFiles);
+    this.filesHint = el("div", "hint files-hint");
+    this.filesStatus = el("div", "files-status");
+    this.fileList = el("div", "file-list");
+    panel.append(toolbar, this.filesHint, this.filesStatus, this.fileList);
+    return panel;
+  }
+
+  // -------------------------------------------------------------- actions
+
+  selectTab(key) {
+    this.tab = key;
+    for (const [name, panel] of Object.entries(this.panels)) {
+      if (panel) panel.hidden = name !== key;
+    }
+    if (this.tabButtons) {
+      for (const [name, tab] of Object.entries(this.tabButtons)) {
+        tab.classList.toggle("active", name === key);
+        tab.setAttribute("aria-selected", String(name === key));
+      }
+    }
+    if (key === "files" && this.files === null && !this.filesLoading) this.loadFiles();
+  }
+
+  jog(axis, direction) {
+    const available = this.capabilities.includes("jog") && this.motionAllowed();
+    if (!available) return;
+    this.card.send(this.entryId, "jog", { axis, distance: direction * this.jogStep });
+  }
+
+  home(axes) {
+    if (!this.capabilities.includes("home") || !this.motionAllowed()) return;
+    this.card.send(this.entryId, "home", { axes });
+  }
+
+  motionAllowed() {
+    return this.online() && !this.activeJob();
+  }
+
+  async applyPreset(preset) {
+    const sends = [];
+    for (const heater of HEATERS) {
+      const value = preset[heater.key];
+      if (value === undefined || value === null) continue;
+      if (!this.capabilities.includes(heater.command)) continue;
+      sends.push(this.card.send(this.entryId, heater.command, { value }, { refresh: false }));
+    }
+    await Promise.all(sends);
+    await this.card.refreshOne(this.entryId);
+  }
+
+  async loadFiles() {
+    if (!this.capabilities.includes("file_list")) return;
+    this.filesLoading = true;
+    this.filesError = null;
+    this._paintFiles();
+    try {
+      this.files = await this.card.listFiles(this.entryId);
+    } catch (err) {
+      this.filesError = err.message || String(err);
+      this.files = this.files || [];
+    } finally {
+      this.filesLoading = false;
+      this._paintFiles();
+    }
+  }
+
+  async upload(file) {
+    this.uploading = file.name;
+    this._paintFiles();
+    try {
+      const stored = await this.card.upload(this.entryId, file);
+      if (this.printAfterInput.checked && this.capabilities.includes("start_print") && stored) {
+        await this.card.send(this.entryId, "start_print", { filename: stored.path || stored.name });
+      }
+    } finally {
+      this.uploading = null;
+      await this.loadFiles();
+    }
+  }
+
+  printFile(file) {
+    if (!this.card.confirm(`Start printing ${baseName(file.name)}? Make sure the bed is clear.`)) return;
+    this.card.send(this.entryId, "start_print", { filename: file.path || file.name });
+  }
+
+  deleteFile(file) {
+    if (!this.card.confirm(`Delete ${baseName(file.name)} from the printer?`)) return;
+    this.card
+      .send(this.entryId, "delete_file", { filename: file.path || file.name })
+      .then(() => this.loadFiles());
+  }
+
+  // --------------------------------------------------------------- update
+
+  online() {
+    return this.description.connected === true && !this.poweredOff;
+  }
+
+  activeJob() {
+    return ACTIVE_STATES.has(this.snapshot.print_state);
+  }
+
+  update(printer, description, power) {
+    this.printer = printer;
+    this.description = description || {};
+    this.snapshot = this.description.printer || {};
+    this.capabilities = this.snapshot.capabilities || [];
+    this.power = power;
+    this.poweredOff = Boolean(power && power.state === "off");
+
+    const caps = this.capabilities;
+    const snapshot = this.snapshot;
+    const state = this.poweredOff ? "off" : snapshot.print_state || "unknown";
+    const color = STATE_COLORS[state] || STATE_COLORS.unknown;
+
+    // Header.
+    this.dot.style.background = color;
+    this.nameEl.textContent = this.description.name || printer.name || "3D printer";
+    const subtitle = [
+      this.description.model || printer.model || this.description.protocol || printer.protocol,
+      this.description.firmware ? `fw ${this.description.firmware}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    this.subtitleEl.textContent = subtitle;
+    this.subtitleEl.hidden = !subtitle;
+    this.stateEl.textContent = STATE_LABELS[state] || state;
+    this.stateEl.style.color = color;
+
+    const lightOn = (snapshot.lights || []).includes("chamber");
+    this.lightButton.hidden = !caps.includes("set_light");
+    this.lightButton.classList.toggle("on", lightOn);
+    this.lightButton.setAttribute("aria-pressed", String(lightOn));
+    this.lightButton.disabled = !this.online() || this.card.isBusy(this.entryId, "set_light");
+
+    this.powerButton.hidden = !power;
+    if (power) {
+      const on = power.state === "on";
+      this.powerButton.classList.toggle("on", on);
+      this.powerButton.setAttribute("aria-pressed", String(on));
+      this.powerButton.disabled = !["on", "off"].includes(power.state) || this.card.powerBusy;
+      this.powerButton.title = power.missing
+        ? `${power.entity_id} does not exist`
+        : `Power (${power.entity_id}): ${power.state}`;
+    }
+
+    // Warnings.
+    let warning = "";
+    if (power && power.missing) warning = `The power entity ${power.entity_id} does not exist.`;
+    else if (this.poweredOff) warning = "The printer is switched off.";
+    else if (!this.description.connected) {
+      warning = this.description.last_error || this.description.error || "The printer is not answering.";
+    }
+    this.warningEl.textContent = warning;
+    this.warningEl.hidden = !warning;
+    this.warningEl.classList.toggle("off", this.poweredOff);
+
+    this.errorsEl.replaceChildren();
+    const errors = this.poweredOff || !this.description.connected ? [] : snapshot.errors || [];
+    for (const error of errors) this.errorsEl.appendChild(el("div", "error-line", error));
+    this.errorsEl.hidden = errors.length === 0;
+
+    this._updateCamera();
+    this._updateStatus();
+    if (!this.compact) {
+      this._updateControls();
+      this._updateFilesAvailability();
+      this._paintFiles();
+      this._updateFooter();
+    } else {
+      this.footer.hidden = true;
+    }
+  }
+
+  _updateCamera() {
+    const caps = this.capabilities;
+    const description = this.description;
+    const live = description.camera_url;
+    const still = description.snapshot_url;
+    const wanted = this.card.showCamera() && caps.includes("camera") && Boolean(live || still);
+    this.cameraColumn.hidden = !wanted;
+    this.body.classList.toggle("with-camera", wanted);
+    if (!wanted) {
+      this._suspendCamera();
+      return;
+    }
+
+    if (this.poweredOff) {
+      this._suspendCamera();
+      this.cameraPlaceholder.textContent = "Switched off";
+      this.cameraPlaceholder.hidden = false;
+      this.cameraOverlay.hidden = true;
+      return;
+    }
+
+    if (!this.image) {
+      this.image = el("img");
+      this.image.alt = "Printer camera";
+      this.image.addEventListener("error", () => this._cameraFailed());
+      this.image.addEventListener("load", () => {
+        this.cameraPlaceholder.hidden = true;
+      });
+      this.cameraFrame.insertBefore(this.image, this.cameraFrame.firstChild);
+    }
+
+    const camera = this.camera;
+    const now = Date.now();
+    this.cameraPlaceholder.textContent = "Camera unavailable";
+    // A camera that failed outright is left alone for a while rather than hammered.
+    if (camera.failedAt && now - camera.failedAt < CAMERA_RETRY_MS) return;
+
+    // The live stream is preferred. A stream that failed falls back to the still for
+    // a while and is then tried again, because a camera server that dropped one
+    // connection usually takes the next.
+    const streamAllowed = Boolean(live) && (!camera.degradedAt || now - camera.degradedAt > CAMERA_RETRY_MS);
+    const mode = streamAllowed || !still ? "stream" : "snapshot";
+    let src = null;
+    if (mode === "stream") {
+      // The stream keeps the URL it started with: every poll signs a new one, and
+      // changing `src` would tear down the one upstream connection.
+      const stale = camera.mode !== "stream" || !camera.src || camera.suspended || camera.failedAt;
+      if (stale || now - camera.signedAt > CAMERA_RESIGN_MS) src = live;
+    } else {
+      // A still only changes when it is fetched again, so it is fetched every poll.
+      src = still;
+    }
+    if (src) {
+      camera.mode = mode;
+      camera.src = src;
+      camera.signedAt = now;
+      camera.suspended = false;
+      camera.failedAt = 0;
+      if (mode === "stream") camera.degradedAt = 0;
+      this.image.dataset.mode = mode;
+      if (this.image.getAttribute("src") !== src) this.image.src = src;
+    }
+    this.image.hidden = false;
+
+    const snapshot = this.snapshot;
+    this.cameraOverlay.replaceChildren();
+    const state = snapshot.print_state || "unknown";
+    if (ACTIVE_STATES.has(state) || state === "finished") {
+      const chip = el("span", "overlay-chip", STATE_LABELS[state] || state);
+      chip.style.background = STATE_COLORS[state];
+      this.cameraOverlay.appendChild(chip);
+      const percent = asNumber(snapshot.progress);
+      if (percent !== null) this.cameraOverlay.appendChild(el("span", "overlay-chip dark", `${percent.toFixed(0)}%`));
+    }
+    this.cameraOverlay.hidden = this.cameraOverlay.childElementCount === 0;
+  }
+
+  _cameraFailed() {
+    const camera = this.camera;
+    if (camera.suspended || !this.image) return;
+    const still = this.description.snapshot_url;
+    if (camera.mode === "stream" && still) {
+      camera.mode = "snapshot";
+      camera.src = still;
+      camera.signedAt = Date.now();
+      camera.degradedAt = Date.now();
+      this.image.dataset.mode = "snapshot";
+      this.image.src = still;
+      return;
+    }
+    camera.failedAt = Date.now();
+    this.image.hidden = true;
+    this.cameraPlaceholder.hidden = false;
+  }
+
+  _suspendCamera() {
+    if (!this.image || this.camera.suspended) return;
+    this.camera.suspended = true;
+    this.image.removeAttribute("src");
+    this.image.hidden = true;
+  }
+
+  _updateStatus() {
+    const caps = this.capabilities;
+    const snapshot = this.snapshot;
+    const state = snapshot.print_state || "unknown";
+
+    const percent = asNumber(snapshot.progress);
+    const showProgress = percent !== null && caps.includes("pause") && !this.poweredOff;
+    this.progressBlock.hidden = !showProgress;
+    if (showProgress) {
+      this.progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+      this.progressFill.style.background = STATE_COLORS[state] || STATE_COLORS.printing;
+      this.progressLabel.textContent = `${percent.toFixed(0)}%`;
+    }
+
+    this.statsEl.replaceChildren();
+    const layers =
+      asNumber(snapshot.current_layer) !== null && asNumber(snapshot.total_layers) !== null
+        ? `${snapshot.current_layer} / ${snapshot.total_layers}`
+        : null;
+    const remaining = asNumber(snapshot.remaining);
+    for (const [key, label, value] of [
+      ["layer", "Layer", layers],
+      ["remaining", "Remaining", remaining !== null ? formatDuration(remaining) : null],
+      ["elapsed", "Elapsed", asNumber(snapshot.elapsed) !== null ? formatDuration(snapshot.elapsed) : null],
+      ["eta", "Done at", ACTIVE_STATES.has(state) ? formatEta(remaining) : null],
+      ["speed", "Speed", asNumber(snapshot.speed_factor) !== null ? `${snapshot.speed_factor}%` : null],
+    ]) {
+      if (value === null || value === undefined || this.poweredOff) continue;
+      const cell = el("div", "stat");
+      cell.dataset.stat = key;
+      cell.append(el("span", "stat-label", label), el("span", "stat-value", value));
+      this.statsEl.appendChild(cell);
+    }
+    this.statsEl.hidden = this.statsEl.childElementCount === 0;
+
+    this.jobEl.replaceChildren();
+    if (snapshot.filename && !this.poweredOff) {
+      this.jobEl.append(icon("file", 16), el("span", "job-name", baseName(snapshot.filename)));
+      this.jobEl.title = snapshot.filename;
+    }
+    this.jobEl.hidden = this.jobEl.childElementCount === 0;
+
+    this.tempsEl.replaceChildren();
+    if (!this.poweredOff) {
+      const chamberVisible = caps.includes("set_chamber_temp") || caps.includes("chamber_sensor");
+      for (const [label, temps, visible] of [
+        ["Nozzle", snapshot.hotend, true],
+        ["Bed", snapshot.bed, true],
+        ["Chamber", snapshot.chamber, chamberVisible],
+      ]) {
+        if (!visible || !temps) continue;
+        if (asNumber(temps.current) === null && asNumber(temps.target) === null) continue;
+        const cell = el("div", "temp");
+        cell.appendChild(el("span", "temp-label", label));
+        const target = asNumber(temps.target);
+        const current = formatTemperature(temps.current);
+        cell.appendChild(el("span", "temp-value", target ? `${current} → ${target.toFixed(0)} °C` : current));
+        if (target) cell.classList.add("heating");
+        this.tempsEl.appendChild(cell);
+      }
+    }
+    this.tempsEl.hidden = this.tempsEl.childElementCount === 0;
+
+    this.fansReadout.replaceChildren();
+    const fans = snapshot.fans || {};
+    if (!this.poweredOff) {
+      for (const fan of [...SETTABLE_FANS, ...REPORTED_FANS]) {
+        const value = asNumber(fans[fan.key]);
+        if (value === null) continue;
+        const cell = el("span", "fan-reading");
+        cell.append(icon("fan", 14), el("span", "", `${fan.label} ${value.toFixed(0)}%`));
+        if (value > 0) cell.classList.add("spinning");
+        this.fansReadout.appendChild(cell);
+      }
+    }
+    this.fansReadout.hidden = this.fansReadout.childElementCount === 0;
+
+    const online = this.online();
+    const printing = state === "printing";
+    const paused = state === "paused";
+    const busy = (command) => this.card.isBusy(this.entryId, command);
+    this.pauseButton.hidden = !caps.includes("pause");
+    this.pauseButton.disabled = !online || !printing || busy("pause");
+    this.resumeButton.hidden = !caps.includes("resume");
+    this.resumeButton.disabled = !online || !paused || busy("resume");
+    this.stopButton.hidden = !caps.includes("stop");
+    this.stopButton.disabled = !online || !ACTIVE_STATES.has(state) || busy("stop");
+    this.jobControls.hidden = !["pause", "resume", "stop"].some((item) => caps.includes(item));
+  }
+
+  _updateControls() {
+    const caps = this.capabilities;
+    const snapshot = this.snapshot;
+    const online = this.online();
+    const busy = (command) => this.card.isBusy(this.entryId, command);
+
+    let anyHeater = false;
+    for (const heater of HEATERS) {
+      const parts = this.heaterRows[heater.key];
+      const allowed = caps.includes(heater.command);
+      parts.row.hidden = !allowed;
+      if (!allowed) continue;
+      anyHeater = true;
+      const temps = snapshot[heater.key] || {};
+      parts.current.textContent = formatTemperature(temps.current);
+      if (!editing(parts.input)) {
+        const target = asNumber(temps.target);
+        parts.input.value = target === null ? "" : String(Math.round(target));
+      }
+      parts.input.disabled = !online;
+      for (const node of parts.row.querySelectorAll("button")) {
+        node.disabled = !online || busy(heater.command);
+      }
+    }
+    this.heaterSection.hidden = !anyHeater;
+    for (const node of this.presetRow.querySelectorAll("button")) node.disabled = !online;
+
+    const fans = snapshot.fans || {};
+    let anyFan = false;
+    for (const fan of SETTABLE_FANS) {
+      const slider = this.fanSliders[fan.key];
+      const value = asNumber(fans[fan.key]);
+      const shown = caps.includes("set_fan_speed") && value !== null;
+      slider.row.hidden = !shown;
+      if (!shown) continue;
+      anyFan = true;
+      if (!editing(slider.input)) {
+        slider.input.value = String(Math.round(value));
+        slider.value.textContent = `${Math.round(value)}%`;
+      }
+      slider.input.disabled = !online;
+    }
+    const speed = asNumber(snapshot.speed_factor);
+    const speedShown = caps.includes("set_speed");
+    this.speedSlider.row.hidden = !speedShown;
+    if (speedShown) {
+      if (!editing(this.speedSlider.input) && speed !== null) {
+        this.speedSlider.input.value = String(Math.min(100, Math.round(speed)));
+        this.speedSlider.value.textContent = `${Math.round(speed)}%`;
+      }
+      this.speedSlider.input.disabled = !online;
+    }
+    this.reportedFans.replaceChildren();
+    for (const fan of REPORTED_FANS) {
+      const value = asNumber(fans[fan.key]);
+      if (value === null) continue;
+      this.reportedFans.appendChild(el("span", "fan-reading", `${fan.label} ${value.toFixed(0)}%`));
+    }
+    this.reportedFans.hidden = this.reportedFans.childElementCount === 0;
+    this.fanSection.hidden = !anyFan && !speedShown;
+
+    const canJog = caps.includes("jog");
+    const canHome = caps.includes("home");
+    const allowed = this.motionAllowed();
+    this.motionSection.hidden = !canJog && !canHome;
+    this.joystick.hidden = !canJog;
+    this.zColumn.hidden = !canJog && !canHome;
+    this.stepChips.hidden = !canJog;
+    for (const node of this.jogButtons) {
+      node.hidden = !canJog;
+      node.disabled = !allowed || busy("jog");
+    }
+    for (const node of [this.homeXY, this.homeZ, this.homeAll]) {
+      node.hidden = !canHome;
+      node.disabled = !allowed || busy("home");
+    }
+    this.homeXY.hidden = !canHome || !canJog;
+    const position = snapshot.position;
+    this.positionEl.replaceChildren();
+    if (position && !this.poweredOff) {
+      for (const axis of ["x", "y", "z"]) {
+        const value = asNumber(position[axis]);
+        const cell = el("span", "axis");
+        const homed = (snapshot.homed_axes || []).includes(axis);
+        cell.classList.toggle("homed", homed);
+        cell.title = homed ? `${axis.toUpperCase()} is homed` : `${axis.toUpperCase()} is not homed`;
+        cell.append(el("span", "axis-name", axis.toUpperCase()), el("span", "axis-value", value === null ? "—" : value.toFixed(2)));
+        this.positionEl.appendChild(cell);
+      }
+    }
+    this.positionEl.hidden = this.positionEl.childElementCount === 0;
+    this.motionHint.textContent =
+      (canJog || canHome) && online && this.activeJob() ? "The head cannot be moved while a job is running." : "";
+    this.motionHint.hidden = !this.motionHint.textContent;
+
+    this.noControls.hidden = anyHeater || anyFan || speedShown || canJog || canHome;
+  }
+
+  _paintSteps() {
+    if (!this.stepChips) return;
+    for (const chip of this.stepChips.querySelectorAll(".step")) {
+      const active = Number(chip.dataset.step) === this.jogStep;
+      chip.classList.toggle("active", active);
+      chip.setAttribute("aria-pressed", String(active));
+    }
+  }
+
+  _updateFilesAvailability() {
+    const caps = this.capabilities;
+    const online = this.online();
+    const listed = caps.includes("file_list");
+    if (this.tabButtons) this.tabButtons.files.hidden = !listed && !caps.includes("file_upload");
+    this.uploadButton.hidden = !caps.includes("file_upload");
+    this.uploadButton.disabled = !online || Boolean(this.uploading);
+    this.printAfterUpload.hidden = !caps.includes("file_upload") || !caps.includes("start_print");
+    this.refreshFiles.hidden = !listed;
+    this.refreshFiles.disabled = !online || this.filesLoading;
+
+    const withheld = (this.description.unsafe_features || []).find((feature) =>
+      /print/i.test(`${feature.id} ${feature.label}`),
+    );
+    const hint =
+      listed && !caps.includes("start_print") && withheld
+        ? `Starting a print is turned off for this printer. Turn on “${withheld.label}” in the integration's options to print from here.`
+        : "";
+    this.filesHint.textContent = hint;
+    this.filesHint.hidden = !hint;
+
+    // The tab can be open before the first reading says whether files are listed.
+    if (this.tab === "files" && listed && this.files === null && !this.filesLoading && online) {
+      this.loadFiles();
+    }
+  }
+
+  _paintFiles() {
+    if (!this.fileList) return;
+    let status = "";
+    if (this.uploading) status = `Uploading ${this.uploading}…`;
+    else if (this.filesLoading) status = "Reading the printer's files…";
+    else if (this.filesError) status = this.filesError;
+    else if (this.files && this.files.length === 0) status = "No files on the printer.";
+    else if (!this.capabilities.includes("file_list") && this.capabilities.includes("file_upload")) {
+      status = "This printer can receive files but cannot list them.";
+    }
+    this.filesStatus.textContent = status;
+    this.filesStatus.hidden = !status;
+    this.filesStatus.classList.toggle("error", Boolean(this.filesError) && !this.filesLoading);
+
+    this.fileList.replaceChildren();
+    const caps = this.capabilities;
+    const online = this.online();
+    const current = baseName(this.snapshot.filename);
+    const files = [...(this.files || [])].sort((a, b) =>
+      String(b.modified || "").localeCompare(String(a.modified || "")) || baseName(a.name).localeCompare(baseName(b.name)),
+    );
+    for (const file of files) {
+      const row = el("div", "file");
+      row.dataset.file = file.name;
+      const info = el("div", "file-info");
+      info.appendChild(el("div", "file-name", baseName(file.name)));
+      const meta = [formatBytes(file.size), file.modified ? new Date(file.modified).toLocaleString() : ""]
+        .filter(Boolean)
+        .join(" · ");
+      if (meta) info.appendChild(el("div", "file-meta", meta));
+      row.append(icon("file", 18), info);
+      if (caps.includes("start_print")) {
+        const print = button("icon-btn file-print", "Print", "play", "start_print");
+        print.disabled = !online || this.activeJob() || this.card.isBusy(this.entryId, "start_print");
+        print.addEventListener("click", () => this.printFile(file));
+        row.appendChild(print);
+      }
+      if (caps.includes("file_delete")) {
+        const remove = button("icon-btn file-delete danger", "Delete", "delete", "delete_file");
+        remove.disabled = !online || (this.activeJob() && baseName(file.name) === current);
+        remove.addEventListener("click", () => this.deleteFile(file));
+        row.appendChild(remove);
+      }
+      this.fileList.appendChild(row);
+    }
+  }
+
+  _updateFooter() {
+    const description = this.description;
+    this.footer.replaceChildren();
+    if (this.capabilities.includes("web_ui") && description.web_ui_url) {
+      const link = el("a", "link");
+      link.href = description.web_ui_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.append(icon("open", 14), el("span", "", "Open printer page"));
+      this.footer.appendChild(link);
+    }
+    const stats = description.camera_stats;
+    if (stats && stats.viewers) {
+      this.footer.appendChild(el("span", "hint", `${stats.viewers} watching`));
+    }
+    this.footer.hidden = this.footer.childElementCount === 0;
+  }
+}
+
+// --------------------------------------------------------------------- card
+
 class Generic3DPrinterCard extends HTMLElement {
   constructor() {
     super();
@@ -90,25 +1147,59 @@ class Generic3DPrinterCard extends HTMLElement {
     this._config = {};
     this._printers = [];
     this._descriptions = new Map();
+    this._views = new Map();
     this._timer = null;
     this._busy = new Set();
-    this._expanded = null;
+    this._loaded = false;
+    this.powerBusy = false;
   }
 
   static getStubConfig() {
     return {};
   }
 
+  static getConfigElement() {
+    return document.createElement("generic-3dprinter-card-editor");
+  }
+
   setConfig(config) {
-    this._config = config || {};
-    this._render();
+    const next = { ...(config || {}) };
+    if (next.jog_steps !== undefined) {
+      const steps = Array.isArray(next.jog_steps) ? next.jog_steps.map(Number) : [];
+      if (!steps.length || steps.some((step) => !(step > 0))) {
+        throw new Error("jog_steps must be a list of positive distances in millimetres");
+      }
+    }
+    if (next.temperature_presets !== undefined && !Array.isArray(next.temperature_presets)) {
+      throw new Error("temperature_presets must be a list of {name, hotend, bed}");
+    }
+    this._config = next;
+    // The layout depends on the configuration, so the views are rebuilt. Their
+    // streams are stopped first, so a discarded view does not keep one open.
+    for (const view of this._views.values()) view._suspendCamera();
+    this._views.clear();
+    this._sync();
   }
 
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this._start();
-    else this._render();
+    if (first) {
+      this._start();
+      return;
+    }
+    // Home Assistant hands a new object on every state change anywhere. Only the
+    // power entity is read from it, so only its change is worth a redraw.
+    const entity = this._config.power_entity;
+    const power = entity ? hass.states && hass.states[entity] : undefined;
+    if (power !== this._lastPower) {
+      this._lastPower = power;
+      this._sync();
+    }
+  }
+
+  get hass() {
+    return this._hass;
   }
 
   connectedCallback() {
@@ -117,11 +1208,43 @@ class Generic3DPrinterCard extends HTMLElement {
 
   disconnectedCallback() {
     this._stop();
+    for (const view of this._views.values()) view._suspendCamera();
   }
 
   getCardSize() {
-    return this._config.fleet ? Math.max(3, this._printers.length * 2) : 6;
+    return this._config.fleet ? Math.max(3, this._printers.length * 4) : 10;
   }
+
+  getGridOptions() {
+    return { columns: 12, min_columns: 6 };
+  }
+
+  // ------------------------------------------------------------- settings
+
+  jogSteps() {
+    const steps = this._config.jog_steps;
+    return Array.isArray(steps) && steps.length ? steps.map(Number) : DEFAULT_JOG_STEPS;
+  }
+
+  presets() {
+    const presets = this._config.temperature_presets;
+    if (!Array.isArray(presets)) return DEFAULT_PRESETS;
+    return presets.filter((preset) => preset && preset.name);
+  }
+
+  showCamera() {
+    return this._config.show_camera !== false;
+  }
+
+  confirm(message) {
+    return window.confirm(message);
+  }
+
+  isBusy(entryId, command) {
+    return this._busy.has(`${entryId}:${command}`);
+  }
+
+  // ------------------------------------------------------------- polling
 
   _start() {
     if (this._timer) return;
@@ -136,403 +1259,520 @@ class Generic3DPrinterCard extends HTMLElement {
     }
   }
 
+  _wanted() {
+    if (this._config.entry_id) {
+      return this._printers.filter((item) => item.entry_id === this._config.entry_id);
+    }
+    return this._config.fleet ? this._printers : this._printers.slice(0, 1);
+  }
+
   async _refreshAll() {
     if (!this._hass) return;
     try {
       const result = await this._hass.callWS({ type: WS_LIST });
       this._printers = result.printers || [];
+      this._error = null;
     } catch (err) {
       this._printers = [];
       this._error = err.message || String(err);
     }
-
-    const wanted = this._config.entry_id
-      ? this._printers.filter((item) => item.entry_id === this._config.entry_id)
-      : this._config.fleet
-        ? this._printers
-        : this._printers.slice(0, 1);
-
-    await Promise.all(
-      wanted.map(async (printer) => {
-        try {
-          const description = await this._hass.callWS({
-            type: WS_DESCRIBE,
-            entry_id: printer.entry_id,
-          });
-          this._descriptions.set(printer.entry_id, description);
-        } catch (err) {
-          this._descriptions.set(printer.entry_id, { error: err.message || String(err) });
-        }
-      }),
-    );
-    this._visible = wanted;
-    this._render();
+    this._visible = this._wanted();
+    await Promise.all(this._visible.map((printer) => this._describe(printer.entry_id)));
+    this._loaded = true;
+    this._sync();
   }
 
-  async _send(entryId, command, data = {}) {
+  async _describe(entryId) {
+    try {
+      const description = await this._hass.callWS({ type: WS_DESCRIBE, entry_id: entryId });
+      this._descriptions.set(entryId, description);
+    } catch (err) {
+      this._descriptions.set(entryId, { error: err.message || String(err) });
+    }
+  }
+
+  async refreshOne(entryId) {
+    await this._describe(entryId);
+    this._sync();
+  }
+
+  // ------------------------------------------------------------- actions
+
+  async send(entryId, command, data = {}, { refresh = true } = {}) {
     const key = `${entryId}:${command}`;
     this._busy.add(key);
-    this._render();
+    this._sync();
     try {
-      await this._hass.callWS({
-        type: WS_SEND,
-        entry_id: entryId,
-        command,
-        data,
-      });
+      await this._hass.callWS({ type: WS_SEND, entry_id: entryId, command, data });
+      return true;
     } catch (err) {
-      this.dispatchEvent(
-        new CustomEvent("hass-notification", {
-          detail: { message: err.message || String(err) },
-          bubbles: true,
-          composed: true,
-        }),
-      );
+      this._notify(err.message || String(err));
+      return false;
     } finally {
       this._busy.delete(key);
-      await this._refreshAll();
+      if (refresh) await this.refreshOne(entryId);
+      else this._sync();
     }
   }
 
-  _render() {
-    if (!this.shadowRoot) return;
-    const style = this._style();
-    const container = el("div", "card");
+  async listFiles(entryId) {
+    const result = await this._hass.callWS({ type: WS_FILES, entry_id: entryId });
+    return result.files || [];
+  }
 
-    if (this._config.title) {
-      container.appendChild(el("div", "card-title", this._config.title));
+  async upload(entryId, file) {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    try {
+      const response = await this._hass.fetchWithAuth(`${API_BASE}/${entryId}/upload`, {
+        method: "POST",
+        body: form,
+      });
+      let body = {};
+      try {
+        body = await response.json();
+      } catch {
+        body = {};
+      }
+      if (!response.ok) throw new Error(body.error || body.message || `HTTP ${response.status}`);
+      this._notify(`${file.name} uploaded to the printer.`);
+      return body.file || null;
+    } catch (err) {
+      this._notify(`Upload failed: ${err.message || String(err)}`);
+      return null;
+    }
+  }
+
+  _power() {
+    const entity = this._config.power_entity;
+    if (!entity || !this._hass) return null;
+    const stateObj = this._hass.states && this._hass.states[entity];
+    if (!stateObj) return { entity_id: entity, state: "unavailable", missing: true };
+    return { entity_id: entity, state: stateObj.state, missing: false };
+  }
+
+  async togglePower(view) {
+    const power = this._power();
+    if (!power || power.missing) return;
+    const on = power.state === "on";
+    if (on) {
+      const snapshot = view.snapshot || {};
+      const nozzle = asNumber(snapshot.hotend && snapshot.hotend.current);
+      let question = "Switch the printer off?";
+      if (ACTIVE_STATES.has(snapshot.print_state)) {
+        question =
+          "The printer is busy. Switching it off ends the job, and the print cannot be resumed. Switch it off anyway?";
+      } else if (nozzle !== null && nozzle > HOT_NOZZLE) {
+        question = `The nozzle is still at ${nozzle.toFixed(0)} °C. Switching the printer off stops the fan that cools it. Switch it off anyway?`;
+      }
+      if (!this.confirm(question)) return;
+    }
+    this.powerBusy = true;
+    this._sync();
+    try {
+      await this._hass.callService("homeassistant", on ? "turn_off" : "turn_on", {
+        entity_id: power.entity_id,
+      });
+    } catch (err) {
+      this._notify(err.message || String(err));
+    } finally {
+      this.powerBusy = false;
+      this._sync();
+    }
+  }
+
+  _notify(message) {
+    this.dispatchEvent(
+      new CustomEvent("hass-notification", {
+        detail: { message },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
+  // ------------------------------------------------------------- drawing
+
+  _sync() {
+    if (!this.shadowRoot) return;
+    if (!this._container) {
+      this.shadowRoot.replaceChildren();
+      this.shadowRoot.appendChild(this._style());
+      this._container = el("ha-card", "card");
+      this._titleEl = el("div", "card-title");
+      this._list = el("div", "printers");
+      this._container.append(this._titleEl, this._list);
+      this.shadowRoot.appendChild(this._container);
+    }
+    this._titleEl.textContent = this._config.title || "";
+    this._titleEl.hidden = !this._config.title;
+
+    const existing = this.shadowRoot.querySelector(".empty");
+    if (existing) existing.remove();
+    if (!this._loaded) return;
+
+    if (this._error || !this._visible || this._visible.length === 0) {
+      this._views.clear();
+      this._list.replaceChildren();
+      const message = this._error
+        ? `Cannot reach the integration: ${this._error}`
+        : "No 3D printer yet. Add one from Settings, Devices and Services.";
+      this._container.appendChild(el("div", "empty", message));
+      return;
     }
 
-    if (this._error) {
-      container.appendChild(el("div", "empty", `Cannot reach the integration: ${this._error}`));
-    } else if (!this._visible || this._visible.length === 0) {
-      container.appendChild(
-        el("div", "empty", "No 3D printer yet. Add one from Settings, Devices and Services."),
-      );
-    } else {
-      for (const printer of this._visible) {
-        container.appendChild(this._renderPrinter(printer));
+    const compact = Boolean(this._config.fleet) && !this._config.entry_id;
+    const power = compact ? null : this._power();
+    const order = [];
+    for (const printer of this._visible) {
+      let view = this._views.get(printer.entry_id);
+      if (!view) {
+        view = new PrinterView(this, printer.entry_id, compact);
+        this._views.set(printer.entry_id, view);
+      }
+      view.update(printer, this._descriptions.get(printer.entry_id) || {}, power);
+      order.push(view.root);
+    }
+    for (const [entryId, view] of this._views) {
+      if (!this._visible.some((printer) => printer.entry_id === entryId)) {
+        view._suspendCamera();
+        this._views.delete(entryId);
       }
     }
-
-    this.shadowRoot.innerHTML = "";
-    this.shadowRoot.appendChild(style);
-    this.shadowRoot.appendChild(container);
-  }
-
-  _renderPrinter(printer) {
-    const description = this._descriptions.get(printer.entry_id) || {};
-    const snapshot = description.printer || {};
-    const capabilities = snapshot.capabilities || [];
-    const state = snapshot.print_state || "unknown";
-    const busy = (command) => this._busy.has(`${printer.entry_id}:${command}`);
-
-    const wrapper = el("div", "printer");
-    wrapper.dataset.entryId = printer.entry_id;
-
-    const header = el("div", "printer-header");
-    const dot = el("span", "dot");
-    dot.style.background = STATE_COLORS[state] || STATE_COLORS.unknown;
-    header.appendChild(dot);
-
-    const names = el("div", "names");
-    names.appendChild(el("div", "name", description.name || printer.name));
-    const subtitle = [
-      description.model || printer.model || description.protocol || printer.protocol,
-      description.firmware ? `fw ${description.firmware}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    if (subtitle) names.appendChild(el("div", "subtitle", subtitle));
-    header.appendChild(names);
-
-    const stateChip = el("div", "state", STATE_LABELS[state] || state);
-    stateChip.style.color = STATE_COLORS[state] || STATE_COLORS.unknown;
-    header.appendChild(stateChip);
-    wrapper.appendChild(header);
-
-    if (!description.connected) {
-      wrapper.appendChild(
-        el("div", "warning", description.last_error || "The printer is not answering."),
-      );
+    const current = [...this._list.children];
+    if (current.length !== order.length || current.some((node, index) => node !== order[index])) {
+      this._list.replaceChildren(...order);
     }
-
-    const body = el("div", "body");
-    const cameraColumn = this._renderCamera(description, capabilities);
-    const infoColumn = el("div", "info");
-    infoColumn.appendChild(this._renderProgress(snapshot, capabilities));
-    infoColumn.appendChild(this._renderTemperatures(snapshot, capabilities));
-    infoColumn.appendChild(this._renderJob(snapshot, capabilities));
-    if (cameraColumn) {
-      body.appendChild(cameraColumn);
-      body.appendChild(infoColumn);
-    } else {
-      body.appendChild(infoColumn);
-    }
-    wrapper.appendChild(body);
-
-    wrapper.appendChild(this._renderControls(printer.entry_id, capabilities, snapshot, busy));
-    wrapper.appendChild(this._renderFooter(description, capabilities));
-    return wrapper;
-  }
-
-  _renderCamera(description, capabilities) {
-    if (!capabilities.includes("camera")) return null;
-
-    /* The live stream is the whole point of the camera pane, so it is preferred.
-     * A still snapshot only moves when this card polls, which makes the picture
-     * change every REFRESH_MS instead of moving.
-     *
-     * Re-rendering must not restart the stream: the element is rebuilt on every
-     * poll, and assigning an identical value to `src` is a no-op in the DOM, so a
-     * viewer that is already watching keeps its one upstream connection. That
-     * matters on hardware whose camera server keeps only a few slots. */
-    const live = description.camera_url;
-    const still = description.snapshot_url;
-    if (!live && !still) return null;
-
-    const column = el("div", "camera");
-    const image = el("img");
-    image.alt = "Printer camera";
-    image.dataset.mode = live ? "stream" : "snapshot";
-
-    if (live) {
-      image.addEventListener("error", () => {
-        if (image.dataset.mode !== "stream") return;
-        if (!still) {
-          image.replaceWith(el("div", "camera-error", "Camera unavailable"));
-          return;
-        }
-        image.dataset.mode = "snapshot";
-        image.src = still;
-      });
-    } else {
-      image.addEventListener("error", () => {
-        image.replaceWith(el("div", "camera-error", "Camera unavailable"));
-      });
-    }
-
-    image.src = live || still;
-    column.appendChild(image);
-    return column;
-  }
-
-  _renderProgress(snapshot, capabilities) {
-    const row = el("div", "progress-block");
-    const percent = asNumber(snapshot.progress);
-    if (percent !== null && capabilities.includes("pause")) {
-      const track = el("div", "progress-track");
-      const fill = el("div", "progress-fill");
-      fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-      fill.style.background = STATE_COLORS[snapshot.print_state] || STATE_COLORS.printing;
-      track.appendChild(fill);
-      row.appendChild(track);
-      row.appendChild(el("div", "progress-label", `${percent.toFixed(0)}%`));
-    }
-
-    const stats = el("div", "stats");
-    const layers =
-      asNumber(snapshot.current_layer) !== null && asNumber(snapshot.total_layers) !== null
-        ? `${snapshot.current_layer} / ${snapshot.total_layers}`
-        : null;
-    for (const [label, value] of [
-      ["Layer", layers],
-      ["Remaining", asNumber(snapshot.remaining) !== null ? formatDuration(snapshot.remaining) : null],
-      ["Elapsed", asNumber(snapshot.elapsed) !== null ? formatDuration(snapshot.elapsed) : null],
-      ["Speed", asNumber(snapshot.speed_factor) !== null ? `${snapshot.speed_factor}%` : null],
-    ]) {
-      if (value === null || value === undefined) continue;
-      const cell = el("div", "stat");
-      cell.appendChild(el("span", "stat-label", label));
-      cell.appendChild(el("span", "stat-value", value));
-      stats.appendChild(cell);
-    }
-    if (stats.childElementCount > 0) row.appendChild(stats);
-    return row;
-  }
-
-  _renderTemperatures(snapshot, capabilities) {
-    const grid = el("div", "temps");
-    const entries = [
-      ["Nozzle", snapshot.hotend, true],
-      ["Bed", snapshot.bed, true],
-      ["Chamber", snapshot.chamber, capabilities.includes("set_chamber_temp")],
-    ];
-    for (const [label, temps, visible] of entries) {
-      if (!visible || !temps) continue;
-      if (temps.current === null && temps.target === null) continue;
-      const cell = el("div", "temp");
-      cell.appendChild(el("span", "temp-label", label));
-      const target = asNumber(temps.target);
-      const current = formatTemperature(temps.current);
-      cell.appendChild(
-        el("span", "temp-value", target ? `${current} → ${target.toFixed(0)} °C` : current),
-      );
-      grid.appendChild(cell);
-    }
-    return grid;
-  }
-
-  _renderJob(snapshot, capabilities) {
-    if (!snapshot.filename) return el("div", "hidden");
-    const row = el("div", "job");
-    row.appendChild(el("span", "job-label", "File"));
-    row.appendChild(el("span", "job-name", snapshot.filename.split("/").pop()));
-    return row;
-  }
-
-  _renderControls(entryId, capabilities, snapshot, busy) {
-    const controls = el("div", "controls");
-    const add = (label, command, data, enabled = true, accent = "") => {
-      if (!capabilities.includes(command)) return;
-      const button = el("button", `ctl ${accent}`, label);
-      button.disabled = !enabled || busy(command);
-      button.addEventListener("click", () => this._send(entryId, command, data));
-      controls.appendChild(button);
-    };
-
-    const printing = snapshot.print_state === "printing";
-    const paused = snapshot.print_state === "paused";
-
-    add("Pause", "pause", {}, printing, "primary");
-    add("Resume", "resume", {}, paused, "primary");
-    add("Stop", "stop", {}, printing || paused, "danger");
-    add("Home", "home", { axes: "XYZ" }, !printing && !paused);
-    add("Light", "set_light", { on: true, channel: "chamber" }, true);
-    add("Light off", "set_light", { on: false, channel: "chamber" }, true);
-
-    if (controls.childElementCount === 0) return el("div", "hidden");
-    return controls;
-  }
-
-  _renderFooter(description, capabilities) {
-    const footer = el("div", "footer");
-    if (capabilities.includes("web_ui") && description.web_ui_url) {
-      const link = el("a", "link", "Open printer page");
-      link.href = description.web_ui_url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      footer.appendChild(link);
-    }
-    if (description.camera_stats && description.camera_stats.viewers) {
-      footer.appendChild(
-        el("span", "hint", `${description.camera_stats.viewers} watching`),
-      );
-    }
-    if (footer.childElementCount === 0) return el("div", "hidden");
-    return footer;
   }
 
   _style() {
     const style = document.createElement("style");
     style.textContent = `
-      :host { display: block; }
-      .card {
+      :host { display: block; container-type: inline-size; }
+      ha-card, .card {
+        display: block;
         background: var(--ha-card-background, var(--card-background-color, #fff));
         border-radius: var(--ha-card-border-radius, 12px);
         box-shadow: var(--ha-card-box-shadow, none);
         border: var(--ha-card-border-width, 1px) solid var(--ha-card-border-color, var(--divider-color, #e0e0e0));
         padding: 16px;
         color: var(--primary-text-color);
-        font-family: var(--paper-font-body1_-_font-family, sans-serif);
+        font-family: var(--ha-font-family-body, var(--paper-font-body1_-_font-family, sans-serif));
+        box-sizing: border-box;
       }
-      .card-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; }
-      .printer + .printer { border-top: 1px solid var(--divider-color, #e0e0e0); margin-top: 14px; padding-top: 14px; }
+      [hidden] { display: none !important; }
+      button { font: inherit; }
+      .card-title { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; }
+      .printer + .printer { border-top: 1px solid var(--divider-color, #e0e0e0); margin-top: 16px; padding-top: 16px; }
+
       .printer-header { display: flex; align-items: center; gap: 10px; }
-      .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; }
       .names { flex: 1 1 auto; min-width: 0; }
-      .name { font-weight: 600; }
+      .name { font-weight: 600; font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .subtitle { font-size: 0.78rem; color: var(--secondary-text-color); }
-      .state { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-      .warning { margin-top: 8px; font-size: 0.82rem; color: var(--error-color, #f44336); }
-      .body { display: flex; gap: 14px; margin-top: 12px; flex-wrap: wrap; }
-      .camera { flex: 1 1 220px; min-width: 180px; }
-      .camera img { width: 100%; border-radius: 8px; display: block; background: #000; }
-      .camera-error { font-size: 0.8rem; color: var(--secondary-text-color); }
-      .info { flex: 2 1 260px; min-width: 200px; }
-      .progress-track { height: 8px; border-radius: 4px; background: var(--divider-color, #e0e0e0); overflow: hidden; }
-      .progress-fill { height: 100%; transition: width 0.4s ease; }
-      .progress-label { font-size: 0.85rem; margin-top: 4px; font-variant-numeric: tabular-nums; }
-      .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+      .state { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+
+      .icon-btn {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 38px; height: 38px; border-radius: 50%;
+        border: 1px solid var(--divider-color, #e0e0e0);
+        background: transparent; color: var(--secondary-text-color); cursor: pointer; padding: 0;
+        transition: background 0.2s, color 0.2s, border-color 0.2s;
+      }
+      .icon-btn .label { display: none; }
+      .icon-btn:hover:not(:disabled) { background: var(--secondary-background-color, #f5f5f5); }
+      .icon-btn:disabled { opacity: 0.4; cursor: default; }
+      .light-toggle.on { color: #ffb300; border-color: #ffb300; background: rgba(255, 179, 0, 0.12); }
+      .power-toggle.on { color: var(--success-color, #43a047); border-color: var(--success-color, #43a047); background: rgba(67, 160, 71, 0.12); }
+      .icon-btn.danger { color: var(--error-color, #f44336); }
+
+      .warning { margin-top: 10px; font-size: 0.85rem; color: var(--error-color, #f44336); }
+      .warning.off { color: var(--secondary-text-color); }
+      .errors { margin-top: 6px; }
+      .error-line { font-size: 0.8rem; color: var(--warning-color, #ff9800); }
+
+      .body { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 12px; }
+      @container (min-width: 720px) {
+        .body.with-camera { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); align-items: start; }
+      }
+      .camera-frame {
+        position: relative; border-radius: 10px; overflow: hidden; background: #111;
+        aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center;
+      }
+      .camera img { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+      .camera-error { color: #bbb; font-size: 0.85rem; }
+      .camera-overlay { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 6px; }
+      .overlay-chip { color: #fff; font-size: 0.72rem; font-weight: 700; padding: 3px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em; }
+      .overlay-chip.dark { background: rgba(0, 0, 0, 0.6); }
+      .camera-fullscreen { position: absolute; top: 8px; right: 8px; width: 32px; height: 32px; background: rgba(0, 0, 0, 0.45); color: #fff; border: none; }
+
+      .tabs { display: flex; gap: 4px; padding: 3px; border-radius: 10px; background: var(--secondary-background-color, #f2f2f2); margin-bottom: 12px; }
+      .tab {
+        flex: 1 1 0; border: none; background: transparent; color: var(--secondary-text-color);
+        padding: 7px 10px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.85rem;
+      }
+      .tab.active { background: var(--card-background-color, #fff); color: var(--primary-color); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15); }
+
+      .progress-track { height: 10px; border-radius: 5px; background: var(--divider-color, #e0e0e0); overflow: hidden; }
+      .progress-fill { height: 100%; transition: width 0.4s ease; border-radius: 5px; }
+      .progress-label { font-size: 1.6rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+      .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 10px; margin-top: 10px; }
       .stat { display: flex; flex-direction: column; }
-      .stat-label { font-size: 0.7rem; text-transform: uppercase; color: var(--secondary-text-color); letter-spacing: 0.04em; }
-      .stat-value { font-variant-numeric: tabular-nums; }
-      .temps { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
-      .temp { display: flex; flex-direction: column; }
-      .temp-label { font-size: 0.7rem; text-transform: uppercase; color: var(--secondary-text-color); letter-spacing: 0.04em; }
-      .temp-value { font-variant-numeric: tabular-nums; }
-      .job { display: flex; gap: 8px; margin-top: 10px; font-size: 0.85rem; }
-      .job-label { color: var(--secondary-text-color); }
-      .job-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .stat-label, .temp-label, .section-title, .steps-label {
+        font-size: 0.7rem; text-transform: uppercase; color: var(--secondary-text-color); letter-spacing: 0.05em;
+      }
+      .stat-value { font-variant-numeric: tabular-nums; font-weight: 600; }
+      .job { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 0.88rem; color: var(--secondary-text-color); }
+      .job-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--primary-text-color); }
+      .temps { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 8px; margin-top: 12px; }
+      .temp { display: flex; flex-direction: column; padding: 8px 10px; border-radius: 10px; background: var(--secondary-background-color, #f5f5f5); min-width: 0; }
+      .temp.heating { box-shadow: inset 3px 0 0 var(--warning-color, #ff9800); }
+      .temp-value { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; font-size: 0.95rem; }
+      .fans-readout, .reported-fans { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; font-size: 0.8rem; color: var(--secondary-text-color); }
+      .fan-reading { display: inline-flex; align-items: center; gap: 4px; }
+      .fan-reading.spinning svg { animation: spin 1.2s linear infinite; color: var(--primary-color); }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .fan-reading.spinning svg { animation: none; } }
+
       .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .ctl {
-        border: 1px solid var(--divider-color, #e0e0e0);
-        background: transparent;
-        color: var(--primary-text-color);
-        border-radius: 8px;
-        padding: 7px 14px;
-        font-size: 0.85rem;
-        cursor: pointer;
+        display: inline-flex; align-items: center; gap: 6px;
+        border: 1px solid var(--divider-color, #e0e0e0); background: transparent; color: var(--primary-text-color);
+        border-radius: 10px; padding: 8px 14px; font-size: 0.88rem; cursor: pointer;
       }
       .ctl:hover:not(:disabled) { background: var(--secondary-background-color, #f5f5f5); }
-      .ctl:disabled { opacity: 0.4; cursor: default; }
+      .ctl:disabled, .mini:disabled, .chip:disabled, .jog:disabled { opacity: 0.4; cursor: default; }
       .ctl.primary { border-color: var(--primary-color); color: var(--primary-color); }
       .ctl.danger { border-color: var(--error-color, #f44336); color: var(--error-color, #f44336); }
+
+      .section { padding: 12px 0; border-top: 1px solid var(--divider-color, #e0e0e0); }
+      .section:first-child { border-top: none; padding-top: 0; }
+      .section-title { margin-bottom: 8px; font-weight: 600; }
+      .heater { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 8px; padding: 5px 0; }
+      .heater-name { display: flex; flex-direction: column; }
+      .heater-label { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; }
+      .heater-current { font-variant-numeric: tabular-nums; color: var(--secondary-text-color); font-size: 0.85rem; padding-left: 20px; }
+      .heater-controls { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; justify-content: flex-end; }
+      .heater-input {
+        width: 56px; padding: 6px 4px; border-radius: 8px; border: 1px solid var(--divider-color, #ccc);
+        background: var(--card-background-color, #fff); color: var(--primary-text-color); font: inherit; text-align: center;
+      }
+      .mini {
+        border: 1px solid var(--divider-color, #e0e0e0); background: transparent; color: var(--primary-text-color);
+        border-radius: 8px; padding: 5px 7px; cursor: pointer; font-size: 0.8rem;
+      }
+      .mini.accent { border-color: var(--primary-color); color: var(--primary-color); font-weight: 600; }
+      .presets, .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+      .chip {
+        border: 1px solid var(--divider-color, #e0e0e0); background: transparent; color: var(--primary-text-color);
+        border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 0.82rem;
+      }
+      .chip.active { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .chip.cooldown { color: var(--info-color, #2196f3); border-color: var(--info-color, #2196f3); }
+      .slider-row { display: grid; grid-template-columns: 130px 1fr 48px; gap: 8px; align-items: center; padding: 3px 0; }
+      .slider-label { display: inline-flex; align-items: center; gap: 6px; font-size: 0.88rem; }
+      .slider { width: 100%; accent-color: var(--primary-color); }
+      .slider-value { text-align: right; font-variant-numeric: tabular-nums; font-size: 0.85rem; }
+
+      .motion-body { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+      .pad { display: flex; gap: 14px; align-items: center; }
+      .joystick {
+        position: relative; width: 168px; height: 168px; border-radius: 50%;
+        background: radial-gradient(circle at 50% 45%, var(--card-background-color, #fff) 0 30%, var(--secondary-background-color, #eee) 31% 100%);
+        border: 1px solid var(--divider-color, #ddd); outline: none;
+      }
+      .joystick:focus-visible { box-shadow: 0 0 0 2px var(--primary-color); }
+      .jog {
+        display: inline-flex; align-items: center; justify-content: center; flex-direction: column;
+        border: none; background: transparent; color: var(--primary-text-color); cursor: pointer; border-radius: 12px;
+        font-size: 0.7rem; font-weight: 700;
+      }
+      .jog:hover:not(:disabled) { background: rgba(127, 127, 127, 0.15); color: var(--primary-color); }
+      .jog:active:not(:disabled) { transform: scale(0.94); }
+      .joystick .jog { position: absolute; width: 52px; height: 52px; }
+      .jog.y-plus { top: 4px; left: 58px; }
+      .jog.y-minus { bottom: 4px; left: 58px; }
+      .jog.x-minus { left: 4px; top: 58px; }
+      .jog.x-plus { right: 4px; top: 58px; }
+      .jog.home-center { top: 58px; left: 58px; border-radius: 50%; color: var(--primary-color); }
+      .jog .label { line-height: 1; }
+      .home-center .label, .home-z .label { font-size: 0.6rem; }
+      .z-column {
+        display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 30px;
+        background: var(--secondary-background-color, #eee); border: 1px solid var(--divider-color, #ddd);
+      }
+      .z-column .jog { width: 50px; height: 50px; }
+      .home-z { color: var(--primary-color); }
+      .motion-side { display: flex; flex-direction: column; gap: 10px; min-width: 150px; }
+      .position { display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+      .axis { display: flex; flex-direction: column; padding: 4px 8px; border-radius: 8px; background: var(--secondary-background-color, #f5f5f5); }
+      .axis-name { font-size: 0.68rem; color: var(--secondary-text-color); font-weight: 700; }
+      .axis.homed .axis-name { color: var(--success-color, #43a047); }
+      .empty-panel { color: var(--secondary-text-color); font-size: 0.9rem; }
+
+      .files-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .spacer { flex: 1 1 auto; }
+      .print-after { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; }
+      .files-status { margin-top: 10px; font-size: 0.85rem; color: var(--secondary-text-color); }
+      .files-status.error { color: var(--error-color, #f44336); }
+      .file-list { margin-top: 8px; display: flex; flex-direction: column; max-height: 360px; overflow-y: auto; }
+      .file { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--divider-color, #eee); }
+      .file > svg { color: var(--secondary-text-color); flex: 0 0 auto; }
+      .file-info { flex: 1 1 auto; min-width: 0; }
+      .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .file-meta { font-size: 0.75rem; color: var(--secondary-text-color); }
+      .file .icon-btn { width: 34px; height: 34px; }
+      .file-print { color: var(--primary-color); }
+
       .footer { display: flex; gap: 12px; align-items: center; margin-top: 12px; font-size: 0.8rem; }
-      .link { color: var(--primary-color); text-decoration: none; }
-      .hint { color: var(--secondary-text-color); }
+      .link { display: inline-flex; align-items: center; gap: 4px; color: var(--primary-color); text-decoration: none; }
+      .hint { color: var(--secondary-text-color); font-size: 0.8rem; }
       .empty { color: var(--secondary-text-color); font-size: 0.9rem; }
-      .hidden { display: none; }
-      @media (max-width: 420px) { .body { flex-direction: column; } }
+      @container (max-width: 420px) {
+        .heater { grid-template-columns: 1fr; }
+        .heater-controls { justify-content: flex-start; }
+        .slider-row { grid-template-columns: 1fr 48px; }
+        .slider-label { grid-column: 1 / -1; }
+      }
     `;
     return style;
   }
 }
 
+// ------------------------------------------------------------------ editor
+
+const EDITOR_LABELS = {
+  entry_id: "Printer",
+  power_entity: "Power switch (smart plug)",
+  title: "Title",
+  fleet: "Show every printer, compact",
+  show_camera: "Show the camera",
+};
+
 class Generic3DPrinterCardEditor extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+    this._config = {};
+    this._printers = null;
   }
 
   setConfig(config) {
-    this._config = config || {};
+    this._config = { ...(config || {}) };
     this._render();
   }
 
   set hass(hass) {
+    const first = !this._hass;
     this._hass = hass;
+    if (first) this._loadPrinters();
+    if (this._form) this._form.hass = hass;
+    else this._render();
+  }
+
+  async _loadPrinters() {
+    try {
+      const result = await this._hass.callWS({ type: WS_LIST });
+      this._printers = result.printers || [];
+    } catch {
+      this._printers = [];
+    }
+    this._form = null;
     this._render();
+  }
+
+  _schema() {
+    const printers = this._printers || [];
+    return [
+      {
+        name: "entry_id",
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: printers.map((printer) => ({ value: printer.entry_id, label: printer.name })),
+          },
+        },
+      },
+      { name: "power_entity", selector: { entity: { domain: ["switch", "light", "input_boolean"] } } },
+      { name: "title", selector: { text: {} } },
+      { name: "show_camera", selector: { boolean: {} } },
+      { name: "fleet", selector: { boolean: {} } },
+    ];
+  }
+
+  _changed(config) {
+    const cleaned = { ...config };
+    for (const key of Object.keys(cleaned)) {
+      if (cleaned[key] === "" || cleaned[key] === undefined || cleaned[key] === null) delete cleaned[key];
+    }
+    this._config = cleaned;
+    this.dispatchEvent(
+      new CustomEvent("config-changed", { detail: { config: cleaned }, bubbles: true, composed: true }),
+    );
   }
 
   _render() {
     if (!this.shadowRoot) return;
-    this.shadowRoot.innerHTML = "";
-    const wrapper = document.createElement("div");
+    // Home Assistant's own form, when the frontend has it, gives the entity picker
+    // and the dropdown their native look. The plain fallback keeps the editor usable
+    // anywhere else.
+    if (customElements.get("ha-form") && this._hass) {
+      if (!this._form) {
+        this._form = document.createElement("ha-form");
+        this._form.computeLabel = (field) => EDITOR_LABELS[field.name] || field.name;
+        this._form.addEventListener("value-changed", (event) => this._changed(event.detail.value));
+        this.shadowRoot.replaceChildren(this._form);
+      }
+      this._form.hass = this._hass;
+      this._form.schema = this._schema();
+      this._form.data = { show_camera: true, ...this._config };
+      return;
+    }
+    this._renderPlain();
+  }
+
+  _renderPlain() {
+    const wrapper = el("div", "editor");
+    wrapper.style.display = "grid";
+    wrapper.style.gap = "12px";
     wrapper.style.padding = "8px 0";
 
-    const label = document.createElement("label");
-    label.textContent = "Show the whole fleet";
-    label.style.display = "flex";
-    label.style.gap = "8px";
-    label.style.alignItems = "center";
+    const field = (key, control) => {
+      const label = el("label");
+      label.style.display = "grid";
+      label.style.gap = "4px";
+      label.appendChild(el("span", "", EDITOR_LABELS[key]));
+      label.appendChild(control);
+      wrapper.appendChild(label);
+    };
 
-    const toggle = document.createElement("input");
-    toggle.type = "checkbox";
-    toggle.checked = Boolean(this._config && this._config.fleet);
-    toggle.addEventListener("change", () => {
-      this.dispatchEvent(
-        new CustomEvent("config-changed", {
-          detail: { config: { ...this._config, fleet: toggle.checked } },
-          bubbles: true,
-          composed: true,
-        }),
-      );
-    });
+    const printer = el("select");
+    printer.dataset.key = "entry_id";
+    printer.appendChild(new Option("First printer", ""));
+    for (const item of this._printers || []) printer.appendChild(new Option(item.name, item.entry_id));
+    printer.value = this._config.entry_id || "";
+    printer.addEventListener("change", () => this._changed({ ...this._config, entry_id: printer.value }));
+    field("entry_id", printer);
 
-    label.appendChild(toggle);
-    wrapper.appendChild(label);
-    this.shadowRoot.appendChild(wrapper);
+    for (const key of ["power_entity", "title"]) {
+      const input = el("input");
+      input.dataset.key = key;
+      input.value = this._config[key] || "";
+      input.placeholder = key === "power_entity" ? "switch.printer_plug" : "";
+      input.addEventListener("change", () => this._changed({ ...this._config, [key]: input.value.trim() }));
+      field(key, input);
+    }
+
+    for (const key of ["show_camera", "fleet"]) {
+      const toggle = el("input");
+      toggle.type = "checkbox";
+      toggle.dataset.key = key;
+      toggle.checked = key === "show_camera" ? this._config.show_camera !== false : Boolean(this._config[key]);
+      toggle.addEventListener("change", () => this._changed({ ...this._config, [key]: toggle.checked }));
+      field(key, toggle);
+    }
+
+    this.shadowRoot.replaceChildren(wrapper);
   }
 }
 
@@ -544,14 +1784,16 @@ if (!customElements.get("generic-3dprinter-card-editor")) {
 }
 
 window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "generic-3dprinter-card",
-  name: "3D Printer",
-  description:
-    "Control a 3D printer or a whole fleet: state, progress, temperatures and camera. Draws only the controls the printer reports it supports.",
-  preview: true,
-  documentationURL: "https://github.com/dnviti/ha-generic-3dprinter-controller",
-});
+if (!window.customCards.some((card) => card.type === "generic-3dprinter-card")) {
+  window.customCards.push({
+    type: "generic-3dprinter-card",
+    name: "3D Printer",
+    description:
+      "Full control of a 3D printer: live camera, job, temperatures, fans, a joystick for the head, stored files, and the smart plug it runs from.",
+    preview: true,
+    documentationURL: "https://github.com/dnviti/ha-generic-3dprinter-controller",
+  });
+}
 
 /* eslint-disable no-console */
 console.info(

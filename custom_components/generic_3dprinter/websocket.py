@@ -16,6 +16,7 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import (
     DATA_COORDINATORS,
+    DOMAIN,
     WS_DESCRIBE,
     WS_FILES,
     WS_LIST,
@@ -69,8 +70,10 @@ async def ws_list(
                     "connected": runtime.snapshot.connected,
                     "print_state": runtime.snapshot.print_state.value,
                     "camera": runtime.has_camera,
+                    # The state sensor's unique id is the entry id and its key,
+                    # as every entity of this integration builds its own.
                     "entity_id": er.async_get(hass).async_get_entity_id(
-                        "sensor", DOMAIN, f"{runtime.entry_id}_state"
+                        "sensor", DOMAIN, f"{runtime.entry_id}_printer_state"
                     ),
                 }
                 for runtime in iter_runtimes(hass)

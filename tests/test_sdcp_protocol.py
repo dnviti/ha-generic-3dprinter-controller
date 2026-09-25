@@ -314,6 +314,22 @@ def test_file_list_frame_populates_the_adapter_buffer() -> None:
     assert [item.name for item in entries] == ["/local/a.gcode"]
 
 
+@pytest.mark.parametrize(("second_light", "expected"), [(1, True), (0, False)])
+def test_the_light_is_reported_on_only_when_it_is_on(second_light: int, expected: bool) -> None:
+    """A light the printer reports as off must not read as on, or a toggle only ever turns it off."""
+    from generic_3dprinter.const import LightChannel
+
+    async def scenario() -> bool:
+        adapter = _adapter(frozenset({Capability.SET_LIGHT}))
+        adapter._status = {"LightStatus": {"SecondLight": second_light}}  # noqa: SLF001
+        adapter._reader = asyncio.get_running_loop().create_future()  # noqa: SLF001 - a live reader
+        adapter._ws = type("Ws", (), {"closed": False})()  # noqa: SLF001
+        snapshot = await adapter.async_read()
+        return LightChannel.CHAMBER in snapshot.lights
+
+    assert asyncio.run(scenario()) is expected
+
+
 def test_a_frame_without_a_request_id_does_not_raise() -> None:
     async def scenario() -> None:
         adapter = _adapter(frozenset({Capability.FILE_LIST}))
