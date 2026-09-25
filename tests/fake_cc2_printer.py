@@ -38,10 +38,22 @@ from custom_components.generic_3dprinter.mqtt_client import (
 SERIAL = "F01BXKSWL13QAZJ"
 DEFAULT_CODE = "123456"
 
-#: A full status in the shape the printer sends for method 1002, mid-print.
+#: A full status in the shape a live printer sends for method 1002 on firmware
+#: 02.01.00.00, with the job fields of a print in progress. The field names are the
+#: ones measured on hardware: ``gcode_move`` and ``tool_head``, not the
+#: ``gcode_move_inf`` and ``toolhead`` the community documentation gives.
 FULL_STATUS: dict[str, Any] = {
-    "machine_status": {"status": 2, "sub_status": 2075, "exception_status": [], "progress": 45},
+    "machine_status": {
+        "status": 2,
+        "sub_status": 2075,
+        "sub_status_reason_code": 0,
+        "exception_status": [],
+        "progress": 45,
+    },
     "print_status": {
+        "bed_mesh_detect": True,
+        "enable": True,
+        "filament_detect": True,
         "filename": "benchy.gcode",
         "uuid": "b52af24c-764e-4092-8a50-00e5f8f02b46",
         "current_layer": 225,
@@ -52,20 +64,24 @@ FULL_STATUS: dict[str, Any] = {
         "progress": 45,
         "state": "printing",
     },
-    "extruder": {"temperature": 215.0, "target": 220, "filament_detected": 1},
-    "heater_bed": {"temperature": 58.5, "target": 60},
-    "ztemperature_sensor": {"temperature": 33.0},
+    "extruder": {"filament_detect_enable": 1, "filament_detected": 1, "target": 220, "temperature": 215},
+    "heater_bed": {"target": 60, "temperature": 58},
+    "ztemperature_sensor": {
+        "measured_max_temperature": 0,
+        "measured_min_temperature": 0,
+        "temperature": 33,
+    },
     "fans": {
-        "fan": {"speed": 255, "rpm": 5000},
-        "aux_fan": {"speed": 178, "rpm": 3500},
-        "box_fan": {"speed": 25, "rpm": 800},
-        "heater_fan": {"speed": 255, "rpm": 4500},
-        "controller_fan": {"speed": 255, "rpm": 4000},
+        "fan": {"speed": 255.0},
+        "aux_fan": {"speed": 178.0},
+        "box_fan": {"speed": 25.0},
+        "heater_fan": {"speed": 255.0},
+        "controller_fan": {"speed": 255.0},
     },
     "led": {"status": 1},
-    "gcode_move_inf": {"x": 88.148, "y": 139.946, "z": 1.6, "e": 138.87, "speed_mode": 1},
-    "toolhead": {"homed_axes": "xyz"},
-    "external_device": {"camera": True, "u_disk": False, "type": "0303"},
+    "gcode_move": {"extruder": 138.87, "speed": 1500, "speed_mode": 1, "x": 88.148, "y": 139.946, "z": 1.6},
+    "tool_head": {"homed_axes": "xyz"},
+    "external_device": {"camera": True, "type": "0303", "u_disk": False},
 }
 
 ATTRIBUTES: dict[str, Any] = {
@@ -291,8 +307,13 @@ class FakeCC2Printer:
             return {"error_code": 0, **self.attributes}
         if method == 1002:
             return {"error_code": 0, **copy.deepcopy(self.status)}
+        if method == 1031 and self.status["machine_status"]["status"] != 2:
+            # Measured: the speed mode is refused outside a print, "not printing".
+            return {"error_code": 1010}
+        if method == 1042:
+            return {"error_code": 0, "url": f"http://127.0.0.1:{self.camera_port}/?action=stream"}
         if method == 1044:
-            return {"error_code": 0, "file_list": self.files}
+            return {"error_code": 0, "file_list": self.files, "offset": 0, "total": len(self.files)}
         return {"error_code": 0}
 
     async def push_delta(self, delta: dict[str, Any], *, sequence: int | None = None) -> None:

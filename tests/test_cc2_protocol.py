@@ -177,9 +177,10 @@ def test_parse_status_normalises_a_full_status() -> None:
     assert parsed["camera"] is True
 
 
-def test_parse_status_reads_the_older_field_names() -> None:
+def test_parse_status_reads_the_documented_field_names_too() -> None:
+    """The firmware measured sends ``gcode_move`` and ``tool_head``; the docs name others."""
     parsed = cc2.parse_status(
-        {"gcode_move": {"x": 1, "y": 2, "z": 3}, "tool_head": {"homed_axes": "xy"}, "chamber": {"temperature": 30}}
+        {"gcode_move_inf": {"x": 1, "y": 2, "z": 3}, "toolhead": {"homed_axes": "xy"}, "chamber": {"temperature": 30}}
     )
     assert parsed["position"].z == pytest.approx(3.0)
     assert parsed["homed_axes"] == frozenset({"x", "y"})
@@ -490,6 +491,23 @@ async def test_a_home_acknowledged_only_when_done_does_not_time_out(
         await asyncio.sleep(0.05)
         await asyncio.wait_for(adapter.async_send(Command.HOME), timeout=2)
         assert cc2_printer.params_of(1026) == [{"homed_axes": "xyz"}]
+    finally:
+        await adapter.async_teardown()
+
+
+async def test_the_speed_mode_is_refused_outside_a_print(
+    cc2_printer: FakeCC2Printer, session: aiohttp.ClientSession
+) -> None:
+    """Measured on firmware 02.01.00.00: an idle printer answers 1031 with error 1010."""
+    adapter = make_adapter(cc2_printer, session)
+    try:
+        await adapter.async_setup()
+        await cc2_printer.push_delta({"machine_status": {"status": 1, "sub_status": 0}})
+        await asyncio.sleep(0.05)
+        with pytest.raises(CommandRejectedError) as caught:
+            await adapter.async_send(Command.SET_SPEED, value=50)
+        assert caught.value.code == 1010
+        assert "no print is in progress" in str(caught.value)
     finally:
         await adapter.async_teardown()
 

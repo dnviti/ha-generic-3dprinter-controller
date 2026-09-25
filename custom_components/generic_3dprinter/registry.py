@@ -215,20 +215,19 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
             unsafe=(_UNSAFE_CC2_START_PRINT,),
             evidence={
                 "verified": (
-                    "a live Centauri Carbon 2 (protocol_version 1.0.0) answered the UDP "
-                    "discovery request on port 52700 with its serial, model, lan_status "
-                    "and token_status; its broker on 1883 accepted elegoo/123456 and "
-                    "the subscriptions. In cloud mode the printer answered neither the "
-                    "registration nor methods 1001 and 1002"
+                    "a live Centauri Carbon 2 on firmware 02.01.00.00 in LAN-only mode "
+                    "with an access code: discovery, registration, heartbeat, status "
+                    "deltas, methods 1001, 1002, 1026, 1027, 1028, 1029, 1030, 1042, "
+                    "1044 and 1048, the upload on port 80 and the camera on 8080 all "
+                    "answered as the adapter expects. 1031 was refused with error 1010 "
+                    "while idle, as the firmware only changes the speed mode during a "
+                    "print. In cloud mode the printer answered nothing on its broker"
                 ),
                 "inferred": (
-                    "registration, heartbeat, methods 1001, 1002, 1020, 1021, 1022 and "
-                    "the upload come from Elegoo's elegoo-link SDK; methods 1023, 1028 "
-                    "to 1031, 1042 and 1044 from community clients measured on firmware "
-                    "02.01.00.00; the 1026 and 1027 payloads are built by the SDK's own "
-                    "request converter, whose method table leaves them commented out, "
-                    "and sent by runnane/elegoo-web. None was answered by hardware for "
-                    "this project, because the test printer was not in LAN-only mode"
+                    "methods 1020, 1021, 1022 and 1023, and 1031 during a print, need a "
+                    "print in progress and were not sent; they come from Elegoo's "
+                    "elegoo-link SDK and from community clients measured on the same "
+                    "firmware"
                 ),
             },
             family="elegoo_centauri",

@@ -257,12 +257,14 @@ component. Entity names come from there, not from `strings.json`.
   and the integration's diagnostics report it.
 * The Elegoo SDCP adapter was developed against a live Centauri Carbon on firmware
   `V1.4.49` and verified end to end.
-* The Elegoo **Centauri Carbon 2** adapter follows Elegoo's own elegoo-link SDK and
-  two community clients measured on firmware `02.01.00.00`. A live printer
-  answered discovery and accepted the MQTT connection, but it was in cloud mode,
-  so no request has yet been answered by hardware for this project. The
-  registration's `evidence` says which method comes from which source, and
-  `tools/acceptance_cc2.py` checks a printer read-only once LAN-only mode is on.
+* The Elegoo **Centauri Carbon 2** adapter was checked against a live printer on
+  firmware `02.01.00.00`: status, temperatures, fans, the light, homing, jogging,
+  the file list, an upload and the camera all answered as expected. Pause, resume,
+  stop and starting a print need a print in progress and were not sent; they follow
+  Elegoo's own elegoo-link SDK and community clients measured on the same firmware.
+  The speed mode can only be changed during a print: an idle printer refuses it.
+  `docs/protocol-elegoo-cc2.md` has every measurement, and `tools/acceptance_cc2.py`
+  checks a printer read-only.
 
 ## Documentation
 
@@ -279,7 +281,7 @@ component. Entity names come from there, not from `strings.json`.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 221 tests, about twenty seconds
+python -m pytest tests/ -q     # 222 tests, about twenty seconds
 npm test                       # 46 card tests
 ```
 
