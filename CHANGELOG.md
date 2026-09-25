@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0
+
+**Added**
+
+* **The Elegoo Centauri Carbon 2.** It speaks JSON over an MQTT broker that runs on
+  the printer, not SDCP, so it has an adapter of its own: registration, the
+  heartbeat the printer expects, status deltas merged into the last full status
+  with a full read when deltas go missing, pause, resume, stop, nozzle and bed
+  targets, fans, speed modes, the light, homing and jogging while idle, the file
+  list, uploads, and the camera on port 8080. Starting a print is an opt-in, as on
+  the first Centauri Carbon. The MQTT client is part of the integration, so there
+  is still no dependency to install.
+* **The Centauri Carbon is one entry in the protocol menu**, followed by a step
+  that asks which model it is.
+* **The config flow finds a Centauri Carbon 2's serial number itself**, and refuses
+  a printer in cloud mode with the instruction to turn LAN-only mode on, rather
+  than creating an entry that never connects.
+* **A new card that drives the whole printer**: live camera with the job on top of
+  it, status, temperatures with presets and a cool-down, fan and speed sliders, a
+  joystick with a Z column, homing and keyboard control, the file list with print,
+  delete and upload, and a power button for the smart plug a printer runs from.
+  Switching a printer off asks first, and warns when it is printing or its nozzle
+  is still hot. The card has a visual editor.
+* An upload endpoint for the card, authenticated like any Home Assistant API call.
+* `tools/acceptance_cc2.py`, a read-only check of a real Centauri Carbon 2.
+
+**Fixed**
+
+* **The card's camera restarted every five seconds.** Every poll signs fresh URLs,
+  and the card put the new one on a new image element, so the stream was torn down
+  and reopened on each poll. The card now builds each printer once, keeps the URL
+  its stream started with, and re-signs it only after an hour or a failure.
+* **The card could not list printers.** The WebSocket `list` command referred to a
+  name it never imported, so it failed as soon as one printer was configured.
+* The state entity the `list` command reports was looked up under a unique id no
+  entity has.
+* The card's editor was never offered, because the card did not say it had one.
+* **The Centauri Carbon's light read as on whenever its state was known**, off
+  included, so the light switch showed on and a toggle could only ever turn it off.
+
+**Notes**
+
+* The Centauri Carbon 2 adapter follows Elegoo's elegoo-link SDK and two community
+  clients measured on firmware 02.01.00.00. The test printer answered discovery and
+  took the MQTT connection, but it was in cloud mode, so no request has been
+  answered by hardware for this project yet.
+
 ## 0.3.0
 
 **Fixed**

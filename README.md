@@ -5,12 +5,14 @@ config entry, each protocol is an adapter, and everything a user sees reads one
 shared model, so the dashboard, the entities and the automations never learn which
 protocol a printer speaks.
 
-Covers **Elegoo SDCP** (Centauri Carbon and siblings), **Klipper via Moonraker**,
-**OctoPrint**, **Duet / RepRapFirmware**, and any printer whose only interface is
-its own embedded web page. Adding a protocol is one module plus one registry
-entry.
+Covers the **Elegoo Centauri Carbon** (SDCP) and **Centauri Carbon 2** (MQTT),
+**Klipper via Moonraker**, **OctoPrint**, **Duet / RepRapFirmware**, and any printer
+whose only interface is its own embedded web page. Adding a protocol is one module
+plus one registry entry.
 
-Ships its own Lovelace card, `custom:generic-3dprinter-card`.
+Ships its own Lovelace card, `custom:generic-3dprinter-card`: one card that drives
+the whole printer, with its camera, its job, its heaters and fans, a joystick for
+the head, its stored files, and the smart plug it is powered from.
 
 ## Why this exists
 
@@ -32,7 +34,8 @@ address.
 
 **Controls.** Pause, resume, stop and home buttons; target temperatures, speed
 factor, flow factor and fan duty as numbers; the chamber light as a switch. Each
-one exists only when the printer says it supports it.
+one exists only when the printer says it supports it. The card adds a joystick,
+temperature presets, and file upload, print and delete on top.
 
 **Camera.** A live MJPEG stream, not a slideshow. The card and Home Assistant's own
 camera proxy both read from one shared upstream connection per printer, so a
@@ -70,15 +73,38 @@ Discovery is a convenience, never a guess: a probe that finds something fills in
 the form and you still confirm it. Nothing in the config flow sends a command to a
 printer.
 
+The Centauri Carbon appears once in the protocol menu, as **Elegoo Centauri
+Carbon**, and a second step asks which model it is: the two generations speak
+different protocols.
+
 | Protocol | Default port | Credential |
 | --- | --- | --- |
-| Elegoo SDCP (Centauri Carbon) | 3030, camera 3031 | none on the LAN |
+| Elegoo Centauri Carbon (SDCP) | 3030, camera 3031 | none on the LAN |
+| Elegoo Centauri Carbon 2 (MQTT) | 1883, camera 8080 | access code, if one is set |
 | Klipper via Moonraker | 7125 | API key, if Moonraker requires one |
 | OctoPrint | 5000 or 80 | API key |
 | Duet (RepRapFirmware) | 80 | password, if the board has one |
 | Web page only | 80 | username and password, if the page asks |
 
 The camera port for SDCP defaults to 3031 and only needs changing if you moved it.
+
+### Centauri Carbon 2: turn on LAN-only mode first
+
+A Centauri Carbon 2 answers local clients **only in LAN-only mode**. In cloud mode
+its broker still accepts a connection, and then nothing ever answers. So, on the
+printer's screen:
+
+1. **Settings → Network → LAN Only Mode**, and turn it on.
+2. If the printer shows an **access code** there, enter it in the integration.
+   With no code set, leave the field empty.
+
+The serial number is read from the printer when you add it, so its field can stay
+empty. The config flow checks the mode and refuses a printer in cloud mode with
+that instruction, rather than creating an entry that never connects. LAN-only mode
+turns off Elegoo's cloud and the remote access of its phone app.
+
+The printer shares a handful of client slots between the slicer, the phone app and
+integrations like this one. If it reports that none is free, close one of them.
 
 ### The one dangerous setting
 
@@ -97,6 +123,13 @@ Everything else the integration sends is a confirmed-working command, and the
 adapter never probes an unknown code. You can enable or disable the opt-in later
 in the integration's **Configure** dialog.
 
+The Centauri Carbon 2 has the same opt-in, for a different reason: starting a print
+heats and moves a machine nobody is watching. Its firmware also remembers the last
+auto-levelling choice, so the integration always asks for levelling, and lets the
+printer choose the Canvas tray, because a wrong tray mapping is accepted and then
+printed from the first tray. Moving the head and homing are refused unless the
+printer reports itself idle.
+
 ## The card
 
 The integration registers the card automatically, so there is no Lovelace resource
@@ -108,21 +141,54 @@ type: custom:generic-3dprinter-card
 
 ```yaml
 type: custom:generic-3dprinter-card
+entry_id: 01J...            # optional, the first printer otherwise
+power_entity: switch.printer_plug
+temperature_presets:
+  - { name: PLA, hotend: 210, bed: 60 }
+  - { name: PETG, hotend: 240, bed: 80 }
+jog_steps: [0.1, 1, 10, 50]
+```
+
+```yaml
+type: custom:generic-3dprinter-card
 title: Printers
 fleet: true
 ```
 
+It has a visual editor, so all of this can also be set from the dashboard.
+
 | Option | Meaning |
 | --- | --- |
 | `entry_id` | Show one specific printer |
-| `fleet` | Show every configured printer |
+| `power_entity` | The switch, light or input boolean the printer is powered from, such as a Shelly plug |
+| `show_camera` | `false` hides the camera |
+| `temperature_presets` | Buttons that set the nozzle and the bed together; PLA, PETG and ABS by default |
+| `jog_steps` | The distances the joystick offers, in millimetres |
+| `fleet` | Show every configured printer, compactly |
 | `title` | Heading above the card |
 
 With neither `entry_id` nor `fleet`, the card shows the first printer.
 
+One printer gets three tabs:
+
+* **Status**: progress, layers, time remaining and the time it will be done,
+  temperatures, fans, and pause, resume and stop. Stop asks first.
+* **Controls**: nozzle, bed and chamber targets with nudge buttons, presets and a
+  cool-down; fan and speed sliders; a joystick for X and Y with a Z column, homing,
+  a step selector and the live position. The arrow keys and Page Up / Page Down
+  move the head while the joystick has focus. Motion is disabled while a job runs.
+* **Files**: the printer's files, with print and delete where the printer allows
+  them, and an upload that can start the print once the file is on the printer.
+
+The header carries the chamber light and, with `power_entity`, a power button.
+Switching a printer off always asks first, and says so plainly when it is printing
+or its nozzle is still hot, because cutting the power stops the fan that cools it.
+A printer that is switched off is shown as off rather than as unreachable, and its
+camera is not opened.
+
 The card draws a control only when the printer reports the capability for it, so a
-PrusaLink printer shows no start button and a printer with no camera shows no
-camera pane.
+printer that cannot start a print shows no print button, a printer that cannot jog
+shows no joystick, and a printer with no camera shows no camera pane.
 
 ## Automations
 
@@ -170,6 +236,11 @@ slot. Close the printer's own web page and any slicer watching it.
 clients. If a slicer and a browser already hold them, the printer refuses the
 handshake with HTTP 500 and the integration says so explicitly.
 
+**The Centauri Carbon 2 will not connect.** Check that the printer is in LAN-only
+mode (see above): in cloud mode it takes the connection and never answers, and the
+integration says so. A refused access code is reported as such. "No free client
+slot" means the slicer, the phone app and other clients hold them all.
+
 **Status stops updating while the printer is idle.** On some SDCP firmware the
 push scheduler wedges while idle. The adapter requests status explicitly instead of
 waiting for a push, so this recovers on the next poll.
@@ -186,8 +257,12 @@ component. Entity names come from there, not from `strings.json`.
   and the integration's diagnostics report it.
 * The Elegoo SDCP adapter was developed against a live Centauri Carbon on firmware
   `V1.4.49` and verified end to end.
-* The Elegoo **Centauri Carbon 2** is a different machine on a different protocol
-  (MQTT with an access code) and is not supported yet.
+* The Elegoo **Centauri Carbon 2** adapter follows Elegoo's own elegoo-link SDK and
+  two community clients measured on firmware `02.01.00.00`. A live printer
+  answered discovery and accepted the MQTT connection, but it was in cloud mode,
+  so no request has yet been answered by hardware for this project. The
+  registration's `evidence` says which method comes from which source, and
+  `tools/acceptance_cc2.py` checks a printer read-only once LAN-only mode is on.
 
 ## Documentation
 
@@ -195,6 +270,7 @@ component. Entity names come from there, not from `strings.json`.
 | --- | --- |
 | `docs/architecture.md` | Why the integration is shaped this way |
 | `docs/protocol-elegoo-sdcp-verified.md` | Every SDCP fact observed on real hardware |
+| `docs/protocol-elegoo-cc2.md` | The Centauri Carbon 2 protocol: what is measured and what is sourced |
 | `docs/protocol-adapter-layer-design.md` | The adapter interface and its types |
 | `docs/web-proxy-transport-design.md` | The reverse proxy and socket bridge |
 | `docs/research/` | The cited protocol research, with its open questions marked |
@@ -203,8 +279,8 @@ component. Entity names come from there, not from `strings.json`.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 132 tests, about sixteen seconds
-npm test                       # 16 card tests
+python -m pytest tests/ -q     # 221 tests, about twenty seconds
+npm test                       # 46 card tests
 ```
 
 `tools/` holds the instruments used to work on the SDCP protocol and to prove the
@@ -213,6 +289,7 @@ integration against real hardware:
 | Tool | Purpose |
 | --- | --- |
 | `tools/acceptance_sdcp.py` | Drive the real adapter against a real printer, 21 checks |
+| `tools/acceptance_cc2.py` | The same for a Centauri Carbon 2, read-only |
 | `tools/acceptance_camera.py` | Measure a printer's camera: frames, distinct frames, frame rate |
 | `tools/probe_sdcp.py` | Dump every raw SDCP frame a printer sends |
 | `tools/dump_status.py` | Print the status, attributes and file-list schemas |
