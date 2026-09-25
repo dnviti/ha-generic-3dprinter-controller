@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.1
+
+**Verified**
+
+* **The Centauri Carbon 2 adapter has been run against a live printer** on firmware
+  02.01.00.00, in LAN-only mode with an access code. The read-only acceptance check
+  passed 13 of 13. The active checks, run with the owner's approval, passed 21 of
+  23: status, temperatures, the three fans, the light, homing, jogging, the file
+  list, an upload and the camera all answered as the adapter expects.
+* Pause, resume, stop and starting a print need a print in progress and have not
+  been sent to hardware yet.
+
+**Notes**
+
+* The two checks that did not pass are firmware behaviour. The speed mode can only
+  be changed during a print; an idle printer refuses it, and the card shows that
+  refusal. After homing, Y parks beyond the printable area, and the firmware clamps a
+  move from there to the edge of it.
+* Homing heats the nozzle to about 140 °C for the printer's probe, and leaves it hot.
+  Use the card's power button with that in mind; it warns about a hot nozzle.
+* No code change for users. The integration's diagnostics now report what was
+  measured on hardware, and the test suite's fake printer sends what the hardware
+  sends.
+
 ## 0.4.0
 
 **Added**
