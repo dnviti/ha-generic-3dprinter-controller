@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.0
+
+**Added**
+
+* **Multi-material units, such as Elegoo's CANVAS.** The card gets a filament
+  button and a strip on the Status tab, and both open a popup that draws the unit
+  the way it stands, with each slot as a spool in its filament's colour and the slot
+  in use marked. Selecting a slot shows its material, brand, colour and nozzle range.
+  Where the printer allows it, the popup loads a slot into the nozzle, unloads the
+  one in use, records which filament is in a slot from the printer's own list, and
+  switches auto-refill. Loading and unloading ask first, and are off while the
+  printer is busy. While the unit works, the popup says what it is doing.
+* **A sensor per slot** with the filament's name, or `empty`, and its material,
+  brand, colour and nozzle range as attributes; a sensor for the filament in use;
+  and an auto-refill switch where the printer can be told. They appear when the
+  printer first reports a unit, so a printer without one gets none.
+* **The Centauri Carbon 2** reads its CANVAS with method 2005 and drives it with
+  2001 to 2004, the methods Elegoo's own page sends.
+* **The Centauri Carbon** reads its CANVAS with command 324, measured on a live
+  printer, and only while its status says one is attached. Its firmware's page has
+  no command to load, unload or edit a slot, so the card shows the slots and leaves
+  those to the printer's screen.
+* Four commands for the card and for automations: `load_filament`,
+  `unload_filament`, `set_filament` and `set_auto_refill`.
+
+**Fixed**
+
+* **A Centauri Carbon stopped answering after a power cycle until its web page was
+  opened.** Measured on the printer: it closes a client that does not send the text
+  `ping` its page sends every 30 seconds, and it pushes its status only when asked.
+  The integration sent neither, so its socket was closed every minute and, after a
+  power cycle, it kept reporting the status it had before. It now keeps the socket
+  the way the page does: it pings every 30 seconds, asks for the status on every
+  connection and whenever the last one is more than 20 seconds old, and treats a
+  socket that has gone silent as dead. On the live printer it held one socket for
+  100 seconds without a reconnect, where one that did not ping was closed after 61.
+* **The Centauri Carbon's camera stayed dark after a power cycle.** The printer's
+  page switches the camera on with command 386 before it shows it. The integration
+  now sends the same request before it reads the camera, and again after a failure.
+* A dropped Centauri Carbon socket was sometimes left open, which kept one of the
+  printer's five client slots until the printer timed it out.
+* **A command's effect showed only at the next poll**, up to 30 seconds later.
+  The printer is now read again as soon as a command is taken.
+
 ## 0.4.2
 
 **Fixed**
