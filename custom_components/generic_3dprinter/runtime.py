@@ -342,6 +342,7 @@ class PrinterRuntime:
                 {"id": feature.id, "label": feature.label, "reason": feature.reason}
                 for feature in self.adapter.unsafe_features
             ],
+            "filament_presets": [dict(item) for item in self.adapter.filament_presets],
             "printer": self.snapshot.as_dict(),
         }
 

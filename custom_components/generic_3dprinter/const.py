@@ -121,6 +121,16 @@ class Capability(StrEnum):
     FILE_DELETE = "file_delete"
     CAMERA = "camera"
     WEB_UI = "web_ui"
+    #: The printer reports the slots of a multi-material unit, such as Elegoo's
+    #: CANVAS, and what is loaded in each. A printer that can express this but has
+    #: no unit attached reports no slots, so the card and the entities follow the
+    #: data, not only the capability.
+    FILAMENT_SLOTS = "filament_slots"
+    LOAD_FILAMENT = "load_filament"
+    UNLOAD_FILAMENT = "unload_filament"
+    #: Record which filament sits in a slot: material, brand, colour, temperatures.
+    SET_FILAMENT = "set_filament"
+    SET_AUTO_REFILL = "set_auto_refill"
 
 
 class Command(StrEnum):
@@ -140,6 +150,10 @@ class Command(StrEnum):
     HOME = "home"
     JOG = "jog"
     DELETE_FILE = "delete_file"
+    LOAD_FILAMENT = "load_filament"
+    UNLOAD_FILAMENT = "unload_filament"
+    SET_FILAMENT = "set_filament"
+    SET_AUTO_REFILL = "set_auto_refill"
 
 
 class PrintState(StrEnum):
@@ -179,7 +193,13 @@ class ProtocolId(StrEnum):
 #: refused while an unsafe-gated printer is working, because interrupting a job
 #: destroys the part and, on some firmware, the printer's control daemon.
 STATE_CHANGING_COMMANDS: Final[frozenset[Command]] = frozenset(
-    {Command.START_PRINT, Command.HOME, Command.JOG}
+    {
+        Command.START_PRINT,
+        Command.HOME,
+        Command.JOG,
+        Command.LOAD_FILAMENT,
+        Command.UNLOAD_FILAMENT,
+    }
 )
 
 

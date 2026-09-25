@@ -112,7 +112,9 @@
       "firmware": { "name": "Firmware" },
       "model": { "name": "Model" },
       "serial": { "name": "Serial number" },
-      "ip_address": { "name": "IP address" }
+      "ip_address": { "name": "IP address" },
+      "active_filament": { "name": "Active filament" },
+      "filament_slot": { "name": "Filament slot {slot}" }
     },
     "binary_sensor": {
       "online": { "name": "Online" },
@@ -135,7 +137,8 @@
       "fan_chamber_speed": { "name": "Chamber fan" }
     },
     "switch": {
-      "chamber_light": { "name": "Chamber light" }
+      "chamber_light": { "name": "Chamber light" },
+      "auto_refill": { "name": "Filament auto-refill" }
     },
     "camera": {
       "camera": { "name": "Camera" }

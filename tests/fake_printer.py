@@ -4,6 +4,16 @@ It speaks the frame shapes a real Centauri Carbon produces, including the two
 details that matter most: a command is acknowledged in one frame and its payload
 can arrive in another, and the camera lives on a port of its own. Collapsing either
 one is how a fake passes while the real adapter hangs.
+
+It also behaves the way a live Centauri Carbon on firmware V1.4.49 was measured to:
+
+* it pushes its status only when asked, with command 0 or with the text ``ping``
+  its own web page sends every 30 seconds;
+* it closes a client that has not sent ``ping`` for 60 seconds, when
+  :attr:`FakePrinterServer.ping_timeout` is set, scaled down for the suite;
+* after a power cycle its camera streams nothing until a client sends command 386
+  with ``Enable`` set, as its web page does, when
+  :attr:`FakePrinterServer.camera_needs_enable` is set.
 """
 
 from __future__ import annotations
@@ -89,6 +99,14 @@ class FakePrinterServer:
         }
         self.received: list[dict] = []
         self.sent_commands: list[int] = []
+        #: Pings received, one per ``ping`` text frame.
+        self.pings = 0
+        #: Close a client that has sent no ``ping`` for this many seconds. ``None``
+        #: keeps every client, which is what the older tests were written against.
+        self.ping_timeout: float | None = None
+        #: Serve the camera only once command 386 enabled it since the last power-on.
+        self.camera_needs_enable = False
+        self.video_enabled = False
         self.url: str = ""
         self.camera_port: int = 0
         #: How many clients have opened the camera stream, and how many frames it
@@ -166,8 +184,12 @@ class FakePrinterServer:
         await asyncio.sleep(0)
 
     async def restart(self) -> str:
-        """Stop and start again, keeping the same addresses."""
+        """Stop and start again, keeping the same addresses.
+
+        The camera comes back switched off, as it does on the printer.
+        """
         await self.stop()
+        self.video_enabled = False
         return await self.start()
 
     async def _handle_camera(self, request):
@@ -178,6 +200,8 @@ class FakePrinterServer:
         """
         from aiohttp import web
 
+        if self.camera_needs_enable and not self.video_enabled:
+            return web.Response(status=503, text="video stream is not enabled")
         response = web.StreamResponse(
             status=200,
             headers={
@@ -241,9 +265,26 @@ class FakePrinterServer:
                 }
             )
         )
-        async for message in ws:
+        loop = asyncio.get_running_loop()
+        last_ping = loop.time()
+        while True:
+            wait = None
+            if self.ping_timeout is not None:
+                wait = max(self.ping_timeout - (loop.time() - last_ping), 0)
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=wait)
+            except TimeoutError:
+                # Measured: a client that stops pinging is dropped after a minute.
+                await ws.close(code=1001)
+                break
             if message.type is not WSMsgType.TEXT:
                 break
+            if message.data == "ping":
+                self.pings += 1
+                last_ping = loop.time()
+                # Measured: every ping is answered with a status push.
+                await ws.send_str(self._status_frame())
+                continue
             frame = json.loads(message.data)
             inner = frame.get("Data", {})
             cmd = inner.get("Cmd")
@@ -271,6 +312,15 @@ class FakePrinterServer:
                                 {"name": "/local/part.gcode", "type": 1, "FileSize": 1234}
                             ],
                         },
+                    )
+                )
+            elif cmd == 386:
+                self.video_enabled = bool((inner.get("Data") or {}).get("Enable"))
+                await ws.send_str(
+                    self._response_frame(
+                        cmd,
+                        request_id,
+                        {"Ack": 0, "VideoUrl": f"127.0.0.1:{self.camera_port}/video"},
                     )
                 )
             else:

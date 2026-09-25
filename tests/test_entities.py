@@ -174,6 +174,14 @@ def build_coordinator(
         runtime, _ = build_runtime(capabilities, snapshot)
     coordinator = PrinterCoordinator(hass, runtime, runtime.entry)
     coordinator.async_set_updated_data(runtime.snapshot)
+    # A command is followed by a debounced read of the printer, which needs a
+    # running Home Assistant. The integration tests cover it; here it is counted.
+    coordinator.refreshes = 0
+
+    async def count_refresh() -> None:
+        coordinator.refreshes += 1
+
+    coordinator.async_request_refresh = count_refresh
     hass.data.setdefault(DATA_COORDINATORS, {})[runtime.entry_id] = coordinator
     return coordinator
 
@@ -470,6 +478,7 @@ async def test_a_button_press_sends_its_command() -> None:
 
     await by_key["home"].async_press()
     assert adapter.sent[-1] == (Command.HOME, {"axes": "XYZ"})
+    assert coordinator.refreshes == 1, "a command is followed by a fresh reading"
 
     await by_key["pause"].async_press()
     assert adapter.sent[-1] == (Command.PAUSE, {})

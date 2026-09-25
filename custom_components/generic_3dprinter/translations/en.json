@@ -162,6 +162,12 @@
       },
       "ip_address": {
         "name": "IP address"
+      },
+      "active_filament": {
+        "name": "Active filament"
+      },
+      "filament_slot": {
+        "name": "Filament slot {slot}"
       }
     },
     "binary_sensor": {
@@ -215,6 +221,9 @@
     "switch": {
       "chamber_light": {
         "name": "Chamber light"
+      },
+      "auto_refill": {
+        "name": "Filament auto-refill"
       }
     },
     "camera": {

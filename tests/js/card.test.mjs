@@ -258,10 +258,11 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 
 const tick = (ms = 20) => new Promise((resolveTick) => setTimeout(resolveTick, ms));
 
-/** True when neither the node nor any ancestor is hidden. */
+/** True when neither the node nor any ancestor is hidden, or in a closed dialog. */
 function visible(node) {
   for (let current = node; current; current = current.parentNode) {
     if (current.hidden) return false;
+    if (current.localName === "dialog" && !current.open && !current.hasAttribute("open")) return false;
     if (current.host) break;
   }
   return true;
@@ -991,6 +992,272 @@ test("a printer without file capabilities has no files tab", async () => {
   });
   const tab = card.shadowRoot.querySelector('.tab[data-tab="files"]');
   assert.equal(visible(tab), false);
+});
+
+// ---------------------------------------------------------------- filament
+
+const FILAMENT_COMMANDS = ["load_filament", "unload_filament", "set_filament", "set_auto_refill"];
+
+/** A CANVAS as the backend reports it: slot 2 empty, slot 4 feeding the nozzle. */
+function canvasSystem(overrides = {}) {
+  const slot = (index, name, color, loaded, active = false) => ({
+    unit: 0,
+    slot: index,
+    loaded,
+    active,
+    material: "PLA",
+    name,
+    brand: "ELEGOO",
+    color,
+    min_temp: 190,
+    max_temp: 230,
+  });
+  return {
+    units: [
+      {
+        unit: 0,
+        connected: true,
+        name: "CANVAS",
+        slots: [
+          slot(0, "PLA", "#2850DF", true),
+          slot(1, "PLA Basic", "#FFFFFF", false),
+          slot(2, "PLA Silk", "#F32FF8", true),
+          slot(3, "PLA Matte", "#000000", true, true),
+        ],
+      },
+    ],
+    auto_refill: false,
+    activity: null,
+    active: { unit: 0, slot: 3 },
+    ...overrides,
+  };
+}
+
+const PRESETS = [
+  { material: "PLA", name: "PLA", min_temp: 190, max_temp: 230, brands: ["ELEGOO", "Generic"] },
+  { material: "PLA", name: "PLA Carbon", min_temp: 190, max_temp: 230, brands: ["Generic"] },
+  { material: "PETG", name: "PETG PRO", min_temp: 230, max_temp: 260, brands: ["ELEGOO", "Generic"] },
+];
+
+/** An idle Centauri Carbon 2 with a CANVAS, able to do `commands`. */
+function canvasCc2({ commands = FILAMENT_COMMANDS, system = canvasSystem(), state = "idle" } = {}) {
+  const cc2 = idleCc2({ filament_presets: PRESETS });
+  cc2.printer.capabilities = [...cc2.printer.capabilities, "filament_slots", ...commands];
+  cc2.printer.filament = system;
+  cc2.printer.print_state = state;
+  return cc2;
+}
+
+async function openFilament(card) {
+  const toggle = card.shadowRoot.querySelector(".filament-toggle");
+  assert.ok(toggle && visible(toggle), "expected a filament button");
+  toggle.click();
+  await tick();
+  const dialog = card.shadowRoot.querySelector(".filament-dialog");
+  assert.ok(visible(dialog.querySelector(".fd-body")), "expected the filament popup to be open");
+  return dialog;
+}
+
+const spool = (dialog, key) => dialog.querySelector(`.spool[data-key="${key}"]`);
+
+test("the filament button and strip appear only for a printer with a multi-material unit", async () => {
+  const plain = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: idleCc2() },
+  });
+  assert.deepEqual(all(plain.card, ".filament-toggle"), []);
+  assert.deepEqual(all(plain.card, ".filament-strip"), []);
+
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  assert.equal(all(card, ".filament-toggle").length, 1);
+  assert.deepEqual(texts(card, ".strip-label"), ["PLA Matte in use, slot 4"]);
+  assert.equal(all(card, ".strip-dot").length, 4);
+});
+
+test("the popup draws the unit the way it stands, with the slot in use selected", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  const dialog = await openFilament(card);
+  // Counter-clockwise from the top left, as on the CANVAS: 1 and 4 on top, 2 and 3 below.
+  assert.deepEqual([...dialog.querySelectorAll(".spool")].map((node) => node.dataset.key), [
+    "0:0",
+    "0:3",
+    "0:1",
+    "0:2",
+  ]);
+  assert.ok(spool(dialog, "0:3").classList.contains("active"));
+  assert.equal(spool(dialog, "0:3").getAttribute("aria-pressed"), "true");
+  assert.equal(spool(dialog, "0:1").querySelector(".spool-name").textContent, "Empty");
+  assert.equal(dialog.querySelector(".fd-detail-name").textContent, "4 · PLA Matte");
+  assert.equal(dialog.querySelector(".fd-badge").textContent, "In use");
+
+  dialog.querySelector(".fd-close").click();
+  await tick();
+  assert.equal(visible(dialog.querySelector(".fd-body")), false);
+});
+
+test("loading a slot asks first and sends its unit and slot", async () => {
+  const { card, calls, confirmations } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  const dialog = await openFilament(card);
+  spool(dialog, "0:2").click();
+  await tick();
+  const load = dialog.querySelector(".fd-load");
+  assert.equal(load.disabled, false);
+  load.click();
+  await tick();
+  assert.match(confirmations[0], /slot 3, PLA Silk/);
+  assert.deepEqual(sent(calls).map((call) => [call.command, call.data]), [
+    ["load_filament", { unit: 0, slot: 2 }],
+  ]);
+});
+
+test("a load that is not confirmed sends nothing", async () => {
+  const { card, calls } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+    confirm: false,
+  });
+  const dialog = await openFilament(card);
+  spool(dialog, "0:0").click();
+  await tick();
+  dialog.querySelector(".fd-load").click();
+  await tick();
+  assert.deepEqual(sent(calls), []);
+});
+
+test("load is offered for a loaded slot not in use, unload only for the one in use", async () => {
+  const { card, calls } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  const dialog = await openFilament(card);
+  const load = dialog.querySelector(".fd-load");
+  const unload = dialog.querySelector(".fd-unload");
+
+  spool(dialog, "0:1").click();
+  await tick();
+  assert.equal(load.disabled, true, "an empty slot cannot be loaded");
+  assert.equal(unload.disabled, true);
+
+  spool(dialog, "0:3").click();
+  await tick();
+  assert.equal(load.disabled, true, "the slot in use is already loaded");
+  assert.equal(unload.disabled, false);
+  unload.click();
+  await tick();
+  assert.deepEqual(sent(calls).map((call) => [call.command, call.data]), [
+    ["unload_filament", { unit: 0, slot: 3 }],
+  ]);
+});
+
+test("a slot's filament is recorded from the printer's own list", async () => {
+  const { card, calls } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  const dialog = await openFilament(card);
+  spool(dialog, "0:1").click();
+  await tick();
+  dialog.querySelector(".fd-edit").click();
+  await tick();
+  const form = dialog.querySelector(".fd-form");
+  assert.equal(visible(form), true);
+  assert.equal(visible(dialog.querySelector(".fd-detail")), false);
+
+  const brand = form.querySelector(".fd-brand");
+  assert.deepEqual([...brand.options].map((option) => option.value), ["ELEGOO", "Generic"]);
+  assert.equal(brand.value, "ELEGOO");
+  const material = form.querySelector(".fd-material");
+  // PLA Carbon is only sold as Generic, so ELEGOO does not list it.
+  assert.deepEqual([...material.querySelectorAll("option")].map((option) => option.value), ["PLA", "PETG PRO"]);
+  assert.deepEqual([...material.querySelectorAll("optgroup")].map((group) => group.label), ["PLA", "PETG"]);
+
+  material.value = "PETG PRO";
+  material.dispatchEvent(new card.ownerDocument.defaultView.Event("change"));
+  assert.equal(form.querySelector('[aria-label="Lowest nozzle temperature"]').value, "230");
+  assert.equal(form.querySelector('[aria-label="Highest nozzle temperature"]').value, "260");
+  form.querySelector(".fd-color").value = "#00ff00";
+
+  form.querySelector(".fd-save").click();
+  await tick();
+  assert.deepEqual(sent(calls).map((call) => [call.command, call.data]), [
+    [
+      "set_filament",
+      {
+        unit: 0,
+        slot: 1,
+        brand: "ELEGOO",
+        color: "#00FF00",
+        material: "PETG",
+        name: "PETG PRO",
+        min_temp: 230,
+        max_temp: 260,
+      },
+    ],
+  ]);
+  assert.equal(visible(form), false, "the form closes once the printer took it");
+});
+
+test("auto-refill is switched from the popup", async () => {
+  const { card, calls } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2() },
+  });
+  const dialog = await openFilament(card);
+  const refill = dialog.querySelector(".fd-refill");
+  assert.equal(visible(refill), true);
+  assert.equal(refill.checked, false);
+  refill.checked = true;
+  refill.dispatchEvent(new card.ownerDocument.defaultView.Event("change"));
+  await tick();
+  assert.deepEqual(sent(calls).map((call) => [call.command, call.data]), [
+    ["set_auto_refill", { on: true }],
+  ]);
+});
+
+test("a printer that can only report its slots gets the picture and no buttons", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC1" }],
+    descriptions: { entry1: canvasCc2({ commands: [], system: canvasSystem({ auto_refill: true }) }) },
+  });
+  const dialog = await openFilament(card);
+  assert.equal(dialog.querySelectorAll(".spool").length, 4);
+  assert.deepEqual([...dialog.querySelectorAll(".fd-actions button")].filter(visible), []);
+  assert.match(dialog.querySelector(".fd-note").textContent, /on its own screen/);
+  assert.equal(visible(dialog.querySelector(".fd-refill")), false);
+  assert.equal(dialog.querySelector(".fd-refill-text").textContent, "On");
+});
+
+test("the slots cannot be changed while the printer is busy", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2({ state: "printing" }) },
+  });
+  const dialog = await openFilament(card);
+  spool(dialog, "0:0").click();
+  await tick();
+  for (const name of [".fd-load", ".fd-unload", ".fd-edit"]) {
+    assert.equal(dialog.querySelector(name).disabled, true, `${name} is enabled mid-print`);
+  }
+  assert.match(dialog.querySelector(".fd-note").textContent, /busy/);
+});
+
+test("what the unit is doing is shown on the card and in the popup", async () => {
+  const { card } = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: canvasCc2({ system: canvasSystem({ activity: "Loading: heating the nozzle" }) }) },
+  });
+  assert.deepEqual(texts(card, ".strip-label"), ["Loading: heating the nozzle"]);
+  const dialog = await openFilament(card);
+  assert.equal(dialog.querySelector(".fd-activity").textContent, "Loading: heating the nozzle");
 });
 
 // ------------------------------------------------------------------- fleet

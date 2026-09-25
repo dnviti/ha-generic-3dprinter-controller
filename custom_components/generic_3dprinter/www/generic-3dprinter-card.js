@@ -54,6 +54,21 @@ const TIP_DELAY_MS = 250;
 /* How long a text shown by a tap stays up, since a finger never leaves it. */
 const TIP_TOUCH_MS = 4000;
 
+/* A four-slot unit, such as Elegoo's CANVAS, numbers its slots counter-clockwise
+ * from the top left: 1 top left, 2 bottom left, 3 bottom right, 4 top right. The
+ * grid is filled row by row, so the slots are laid out in this order to match the
+ * unit in front of the user. */
+const FOUR_SLOT_ORDER = [0, 3, 1, 2];
+
+/* Colours offered next to the colour picker when a slot's filament is set. */
+const FILAMENT_SWATCHES = [
+  "#FFFFFF", "#000000", "#898989", "#E53935", "#FB8C00",
+  "#FDD835", "#43A047", "#1E88E5", "#8E24AA", "#F48FB1",
+];
+
+/* Brands offered when the printer has no filament list of its own. */
+const DEFAULT_BRANDS = ["Generic"];
+
 const STATE_COLORS = {
   idle: "var(--state-inactive-color, #9e9e9e)",
   preparing: "var(--warning-color, #ff9800)",
@@ -122,6 +137,12 @@ const ICONS = {
   fan: "M12,11A1,1 0 0,0 11,12A1,1 0 0,0 12,13A1,1 0 0,0 13,12A1,1 0 0,0 12,11M12.5,2C17,2 17.11,5.57 14.75,6.75C13.76,7.24 13.32,8.29 13.13,9.22C13.61,9.42 14.03,9.73 14.35,10.13C18.05,8.13 22.03,8.92 22.03,12.5C22.03,17 18.46,17.1 17.28,14.73C16.78,13.74 15.72,13.3 14.79,13.11C14.59,13.59 14.28,14 13.88,14.34C15.87,18.03 15.08,22 11.5,22C7,22 6.91,18.42 9.27,17.24C10.25,16.75 10.69,15.71 10.89,14.79C10.4,14.59 9.97,14.27 9.65,13.87C5.96,15.85 2,15.07 2,11.5C2,7 5.56,6.89 6.74,9.26C7.24,10.25 8.29,10.68 9.22,10.87C9.41,10.39 9.73,9.97 10.14,9.65C8.15,5.96 8.94,2 12.5,2Z",
   file: "M13,9V3.5L18.5,9M6,2C4.89,2 4,2.89 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6Z",
   open: "M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z",
+  nozzle: "M7,2H17V8H19V13H16.5L13,17H11L7.5,13H5V8H7V2M10,22H2V20H10A1,1 0 0,0 11,19V18H13V19A3,3 0 0,1 10,22Z",
+  load: "M2 12H4V17H20V12H22V17C22 18.11 21.11 19 20 19H4C2.9 19 2 18.11 2 17V12M12 15L17.55 9.54L16.13 8.13L13 11.25V2H11V11.25L7.88 8.13L6.46 9.55L12 15Z",
+  unload: "M2 12H4V17H20V12H22V17C22 18.11 21.11 19 20 19H4C2.9 19 2 18.11 2 17V12M12 2L6.46 7.46L7.88 8.88L11 5.75V15H13V5.75L16.13 8.88L17.55 7.45L12 2Z",
+  edit: "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z",
+  close: "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z",
+  refill: "M12,6V9L16,5L12,1V4A8,8 0 0,0 4,12C4,13.57 4.46,15.03 5.24,16.26L6.7,14.8C6.25,13.97 6,13 6,12A6,6 0 0,1 12,6M18.76,7.74L17.3,9.2C17.74,10.04 18,11 18,12A6,6 0 0,1 12,18V15L8,19L12,23V20A8,8 0 0,0 20,12C20,10.43 19.54,8.97 18.76,7.74Z",
 };
 
 // ------------------------------------------------------------------ helpers
@@ -210,6 +231,14 @@ const baseName = (path) => String(path || "").split("/").pop();
 const editing = (input) =>
   input.dataset.dirty === "1" || input.getRootNode().activeElement === input;
 
+/** Put `nodes` in `parent` in order, touching the DOM only when something moved. */
+const replaceChildrenIfChanged = (parent, nodes) => {
+  const current = [...parent.children];
+  if (current.length !== nodes.length || current.some((node, index) => node !== nodes[index])) {
+    parent.replaceChildren(...nodes);
+  }
+};
+
 /**
  * The popup that shows a text cut short by an ellipsis in full.
  *
@@ -219,12 +248,15 @@ const editing = (input) =>
  * reader reads all of it. The popup lives on the card rather than beside the text,
  * so the scrolling file list cannot clip it. The file list and the status tiles are
  * rebuilt on every reading, which takes the text out from under the popup, so after
- * a redraw it looks up what now sits where its text was and stays on that.
+ * a redraw it looks up what now sits where its text was and stays on that. A text in
+ * the filament dialog gets the popup inside the dialog, since the dialog sits in the
+ * browser's top layer, above the card.
  */
 class TextTip {
   constructor(root, container) {
     this.root = root;
     this.container = container;
+    this.host = container;
     this.node = el("div", "tip");
     this.node.setAttribute("role", "tooltip");
     this.node.hidden = true;
@@ -326,6 +358,8 @@ class TextTip {
       return;
     }
     this.anchor = target;
+    this.host = target.closest("dialog") || this.container;
+    if (this.node.parentNode !== this.host) this.host.appendChild(this.node);
     this.node.textContent = text;
     this.node.hidden = false;
     this._place();
@@ -335,14 +369,15 @@ class TextTip {
   _place() {
     const gap = 6;
     const margin = 8;
-    const card = this.container;
+    const card = this.host;
     this.node.style.left = "0px";
     this.node.style.top = "0px";
     const anchor = this.anchor.getBoundingClientRect();
     const box = card.getBoundingClientRect();
     const tip = this.node.getBoundingClientRect();
-    const originX = box.left + card.clientLeft;
-    const originY = box.top + card.clientTop;
+    // A scrolled host, such as a tall dialog, moves its positioned children with it.
+    const originX = box.left + card.clientLeft - card.scrollLeft;
+    const originY = box.top + card.clientTop - card.scrollTop;
     const left = Math.max(margin, Math.min(anchor.left - originX - margin, card.clientWidth - tip.width - margin));
     let top = anchor.bottom - originY + gap;
     const above = anchor.top - originY - gap - tip.height;
@@ -350,6 +385,569 @@ class TextTip {
     this.node.style.left = `${left}px`;
     this.node.style.top = `${top}px`;
     this.center = { x: anchor.left + anchor.width / 2, y: anchor.top + anchor.height / 2 };
+  }
+}
+
+// ----------------------------------------------------------------- filament
+
+const slotKey = (unit, slot) => `${unit}:${slot}`;
+
+/** A slot's number as the printer's own screen shows it, counting from 1. */
+const slotLabel = (unit, slot) => (unit === 0 ? String(slot + 1) : `${unit + 1}-${slot + 1}`);
+
+/** What a slot holds, in a word or two. */
+const slotTitle = (slot) => slot.name || slot.material || "Unknown filament";
+
+/** Black or white, whichever reads better on `hex`. */
+const inkFor = (hex) => {
+  const match = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!match) return "#fff";
+  const value = parseInt(match[1], 16);
+  const luminance = (0.299 * ((value >> 16) & 255) + 0.587 * ((value >> 8) & 255) + 0.114 * (value & 255)) / 255;
+  return luminance > 0.6 ? "#111" : "#fff";
+};
+
+const temperatureRange = (slot) => {
+  const low = asNumber(slot.min_temp);
+  const high = asNumber(slot.max_temp);
+  if (low === null && high === null) return "—";
+  if (low === null || high === null) return formatTemperature(low ?? high);
+  return `${low.toFixed(0)}–${high.toFixed(0)} °C`;
+};
+
+/**
+ * The popup that shows what is loaded in a multi-material unit, and drives it.
+ *
+ * It is a native `<dialog>` opened with `showModal()`, so it sits in the browser's
+ * top layer: no dashboard column, card or scrolling view can clip it, and Escape
+ * and the backdrop close it. It draws each unit the way the unit stands in front
+ * of the user, with every slot as a spool in its filament's colour.
+ *
+ * What it offers follows the capabilities: a printer that can only report its
+ * slots gets the picture and the details, and one that can load, unload and
+ * record a slot's filament gets the buttons for that too. It is updated in place
+ * on every reading, and its spools are kept by slot rather than rebuilt, so the
+ * keyboard focus and a form being filled in survive a poll.
+ */
+class FilamentDialog {
+  constructor(view) {
+    this.view = view;
+    this.selected = null;
+    this.editing = false;
+    this.spoolNodes = new Map();
+    this.unitNodes = new Map();
+    this.node = this._build();
+  }
+
+  get card() {
+    return this.view.card;
+  }
+
+  get system() {
+    return this.view.snapshot.filament || null;
+  }
+
+  get isOpen() {
+    return Boolean(this.node.open) || this.node.hasAttribute("open");
+  }
+
+  can(capability) {
+    return this.view.capabilities.includes(capability);
+  }
+
+  /** Every slot of every unit, in order. */
+  slots() {
+    const system = this.system;
+    if (!system) return [];
+    return (system.units || []).flatMap((unit) => unit.slots || []);
+  }
+
+  slot(key) {
+    return key ? this.slots().find((item) => slotKey(item.unit, item.slot) === key) || null : null;
+  }
+
+  // -------------------------------------------------------------- build
+
+  _build() {
+    const dialog = el("dialog", "filament-dialog");
+    dialog.setAttribute("aria-label", "Filament");
+    const body = el("div", "fd-body");
+
+    const head = el("div", "fd-head");
+    const titles = el("div", "fd-titles");
+    this.subtitleEl = el("div", "fd-subtitle trunc");
+    titles.append(el("div", "fd-title", "Filament"), this.subtitleEl);
+    const close = button("icon-btn fd-close", "Close", "close");
+    close.addEventListener("click", () => this.close());
+    head.append(icon("nozzle", 22), titles, close);
+
+    this.activityEl = el("div", "fd-activity");
+
+    const main = el("div", "fd-main");
+    this.unitsEl = el("div", "fd-units");
+    const side = el("div", "fd-side");
+    this.detailEl = this._buildDetail();
+    this.form = this._buildForm();
+    side.append(this.detailEl, this.form);
+    main.append(this.unitsEl, side);
+
+    this.footEl = el("label", "fd-foot");
+    this.refillInput = el("input", "fd-refill");
+    this.refillInput.type = "checkbox";
+    this.refillInput.addEventListener("change", () => {
+      this.card.send(this.view.entryId, "set_auto_refill", { on: this.refillInput.checked });
+    });
+    this.refillText = el("span", "fd-refill-text");
+    this.footEl.append(icon("refill", 18), el("span", "fd-refill-label", "Auto-refill"), this.refillText, this.refillInput);
+
+    body.append(head, this.activityEl, main, this.footEl);
+    dialog.appendChild(body);
+    // A click on the backdrop lands on the dialog itself; one on its content does not.
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) this.close();
+    });
+    dialog.addEventListener("close", () => {
+      this.editing = false;
+      this.update();
+    });
+    return dialog;
+  }
+
+  _buildDetail() {
+    const detail = el("div", "fd-detail");
+    const head = el("div", "fd-detail-head");
+    this.detailSwatch = el("span", "fd-swatch");
+    this.detailName = el("div", "fd-detail-name trunc");
+    this.detailBadge = el("span", "fd-badge");
+    head.append(this.detailSwatch, this.detailName, this.detailBadge);
+    this.detailRows = el("dl", "fd-rows");
+
+    this.actions = el("div", "fd-actions");
+    this.loadButton = button("ctl primary fd-load", "Load", "load", "load_filament");
+    this.loadButton.addEventListener("click", () => this._load());
+    this.unloadButton = button("ctl fd-unload", "Unload", "unload", "unload_filament");
+    this.unloadButton.addEventListener("click", () => this._unload());
+    this.editButton = button("ctl fd-edit", "Edit", "edit", "set_filament");
+    this.editButton.addEventListener("click", () => this._startEdit());
+    this.actions.append(this.loadButton, this.unloadButton, this.editButton);
+
+    this.noteEl = el("div", "hint fd-note");
+    detail.append(head, this.detailRows, this.actions, this.noteEl);
+    return detail;
+  }
+
+  _buildForm() {
+    const form = el("form", "fd-form");
+    form.hidden = true;
+    form.noValidate = true;
+    this.formTitle = el("div", "fd-form-title");
+
+    const field = (label, control) => {
+      const wrap = el("label", "fd-field");
+      wrap.append(el("span", "fd-field-label", label), control);
+      return wrap;
+    };
+
+    this.brandSelect = el("select", "fd-input fd-brand");
+    this.brandSelect.addEventListener("change", () => this._fillMaterials(this.materialSelect.value));
+    this.materialSelect = el("select", "fd-input fd-material");
+    this.materialSelect.addEventListener("change", () => this._applyPreset());
+    this.materialText = el("input", "fd-input fd-material-text");
+    this.materialText.type = "text";
+    this.materialText.maxLength = 40;
+    this.materialText.placeholder = "PLA";
+    this.nameText = el("input", "fd-input fd-name-text");
+    this.nameText.type = "text";
+    this.nameText.maxLength = 40;
+    this.nameText.placeholder = "PLA Matte";
+
+    this.colorInput = el("input", "fd-color");
+    this.colorInput.type = "color";
+    this.colorInput.setAttribute("aria-label", "Colour");
+    const swatches = el("div", "fd-swatches");
+    for (const color of FILAMENT_SWATCHES) {
+      const swatch = button("fd-swatch-btn", color, null);
+      swatch.style.background = color;
+      swatch.dataset.color = color;
+      swatch.addEventListener("click", () => {
+        this.colorInput.value = color.toLowerCase();
+      });
+      swatches.appendChild(swatch);
+    }
+    const colorRow = el("div", "fd-color-row");
+    colorRow.append(this.colorInput, swatches);
+
+    const temperature = (label) => {
+      const input = el("input", "fd-input fd-temp");
+      input.type = "number";
+      input.min = "0";
+      input.max = String(TEMPERATURE_MAX);
+      input.step = "1";
+      input.inputMode = "numeric";
+      input.setAttribute("aria-label", label);
+      return input;
+    };
+    this.minInput = temperature("Lowest nozzle temperature");
+    this.maxInput = temperature("Highest nozzle temperature");
+    const temps = el("div", "fd-temps");
+    temps.append(this.minInput, el("span", "fd-temp-sep", "–"), this.maxInput, el("span", "fd-temp-unit", "°C"));
+
+    this.brandField = field("Brand", this.brandSelect);
+    this.materialField = field("Filament", this.materialSelect);
+    this.materialTextField = field("Material", this.materialText);
+    this.nameTextField = field("Name", this.nameText);
+
+    const buttons = el("div", "fd-actions");
+    this.saveButton = button("ctl primary fd-save", "Save", null, "set_filament");
+    this.saveButton.type = "submit";
+    const cancel = button("ctl fd-cancel", "Cancel", null);
+    cancel.addEventListener("click", () => {
+      this.editing = false;
+      this.update();
+    });
+    buttons.append(this.saveButton, cancel);
+
+    form.append(
+      this.formTitle,
+      this.brandField,
+      this.materialField,
+      this.materialTextField,
+      this.nameTextField,
+      field("Colour", colorRow),
+      field("Nozzle temperature", temps),
+      buttons,
+    );
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this._save();
+    });
+    return form;
+  }
+
+  // ----------------------------------------------------------- actions
+
+  open(key) {
+    const slots = this.slots();
+    if (!slots.length) return;
+    const chosen =
+      this.slot(key) ||
+      slots.find((item) => item.active) ||
+      slots.find((item) => item.loaded) ||
+      slots[0];
+    this.selected = slotKey(chosen.unit, chosen.slot);
+    this.editing = false;
+    this.update();
+    if (this.isOpen) return;
+    if (typeof this.node.showModal === "function") {
+      try {
+        this.node.showModal();
+        return;
+      } catch {
+        // A dialog that cannot be modal is still shown, just without a backdrop.
+      }
+    }
+    this.node.setAttribute("open", "");
+  }
+
+  close() {
+    if (typeof this.node.close === "function" && this.node.open) {
+      this.node.close();
+    } else if (this.node.hasAttribute("open")) {
+      this.node.removeAttribute("open");
+      this.editing = false;
+      this.update();
+    }
+  }
+
+  select(key) {
+    if (this.editing) return;
+    this.selected = key;
+    this.update();
+  }
+
+  _load() {
+    const slot = this.slot(this.selected);
+    if (!slot) return;
+    const question = `Load slot ${slotLabel(slot.unit, slot.slot)}, ${slotTitle(slot)}? The printer heats the nozzle, cuts the filament that is in it and feeds this one.`;
+    if (!this.card.confirm(question)) return;
+    this.card.send(this.view.entryId, "load_filament", { unit: slot.unit, slot: slot.slot });
+  }
+
+  _unload() {
+    const slot = this.slot(this.selected);
+    if (!slot) return;
+    const question = `Unload ${slotTitle(slot)} from slot ${slotLabel(slot.unit, slot.slot)}? The printer heats the nozzle and pulls the filament back into the unit.`;
+    if (!this.card.confirm(question)) return;
+    this.card.send(this.view.entryId, "unload_filament", { unit: slot.unit, slot: slot.slot });
+  }
+
+  presets() {
+    const presets = this.view.description.filament_presets;
+    return Array.isArray(presets) ? presets.filter((item) => item && item.name && item.material) : [];
+  }
+
+  _startEdit() {
+    const slot = this.slot(this.selected);
+    if (!slot) return;
+    this.editing = true;
+    const presets = this.presets();
+    const brands = [...new Set(presets.flatMap((item) => item.brands || []))];
+    const brandList = brands.length ? brands : DEFAULT_BRANDS;
+    this.brandSelect.replaceChildren(...brandList.map((brand) => new Option(brand, brand)));
+    const brand = brandList.find((item) => item.toLowerCase() === String(slot.brand || "").toLowerCase());
+    this.brandSelect.value = brand || brandList[brandList.length - 1];
+
+    const listed = presets.length > 0;
+    this.materialField.hidden = !listed;
+    this.materialTextField.hidden = listed;
+    this.nameTextField.hidden = listed;
+    if (listed) {
+      this._fillMaterials(slot.name || slot.material);
+    } else {
+      this.materialText.value = slot.material || "";
+      this.nameText.value = slot.name && slot.name !== slot.material ? slot.name : "";
+    }
+    this.colorInput.value = (/^#[0-9a-f]{6}$/i.test(slot.color || "") ? slot.color : "#ffffff").toLowerCase();
+    this.minInput.value = asNumber(slot.min_temp) !== null ? String(Math.round(slot.min_temp)) : "";
+    this.maxInput.value = asNumber(slot.max_temp) !== null ? String(Math.round(slot.max_temp)) : "";
+    if (listed && (!this.minInput.value || !this.maxInput.value)) this._applyPreset();
+    this.formTitle.textContent = `Slot ${slotLabel(slot.unit, slot.slot)}`;
+    this.update();
+    this.materialSelect.focus?.();
+  }
+
+  /** List the brand's filaments, grouped by material, keeping `wanted` selected if offered. */
+  _fillMaterials(wanted) {
+    const brand = this.brandSelect.value;
+    const offered = this.presets().filter((item) => !item.brands || !item.brands.length || item.brands.includes(brand));
+    const groups = new Map();
+    for (const preset of offered) {
+      if (!groups.has(preset.material)) groups.set(preset.material, []);
+      groups.get(preset.material).push(preset);
+    }
+    const nodes = [];
+    for (const [material, items] of groups) {
+      const group = document.createElement("optgroup");
+      group.label = material;
+      for (const preset of items) group.appendChild(new Option(preset.name, preset.name));
+      nodes.push(group);
+    }
+    this.materialSelect.replaceChildren(...nodes);
+    const match = offered.find((item) => item.name.toLowerCase() === String(wanted || "").toLowerCase());
+    if (match) this.materialSelect.value = match.name;
+  }
+
+  _applyPreset() {
+    const preset = this.presets().find((item) => item.name === this.materialSelect.value);
+    if (!preset) return;
+    this.minInput.value = String(preset.min_temp);
+    this.maxInput.value = String(preset.max_temp);
+  }
+
+  async _save() {
+    const slot = this.slot(this.selected);
+    if (!slot) return;
+    const data = {
+      unit: slot.unit,
+      slot: slot.slot,
+      brand: this.brandSelect.value,
+      color: this.colorInput.value.toUpperCase(),
+    };
+    if (!this.materialField.hidden) {
+      const preset = this.presets().find((item) => item.name === this.materialSelect.value);
+      if (!preset) return;
+      data.material = preset.material;
+      data.name = preset.name;
+    } else {
+      const material = this.materialText.value.trim();
+      if (!material) {
+        this.materialText.focus?.();
+        return;
+      }
+      data.material = material;
+      if (this.nameText.value.trim()) data.name = this.nameText.value.trim();
+    }
+    const low = asNumber(this.minInput.value);
+    const high = asNumber(this.maxInput.value);
+    if (low !== null) data.min_temp = low;
+    if (high !== null) data.max_temp = high;
+    if (low !== null && high !== null && low > high) {
+      this.card._notify("The lowest nozzle temperature is above the highest.");
+      return;
+    }
+    const sent = await this.card.send(this.view.entryId, "set_filament", data);
+    if (sent) {
+      this.editing = false;
+      this.update();
+    }
+  }
+
+  // ------------------------------------------------------------ update
+
+  update() {
+    const system = this.system;
+    const slots = this.slots();
+    if (!system || !slots.length) {
+      if (this.isOpen) this.close();
+      return;
+    }
+    if (!this.slot(this.selected)) {
+      const fallback = slots.find((item) => item.active) || slots[0];
+      this.selected = slotKey(fallback.unit, fallback.slot);
+    }
+    this.subtitleEl.textContent = this.view.nameEl.textContent;
+    this.activityEl.textContent = system.activity || "";
+    this.activityEl.hidden = !system.activity;
+    this._paintUnits(system);
+    this._paintDetail();
+    this._paintRefill(system);
+    this.detailEl.hidden = this.editing;
+    this.form.hidden = !this.editing;
+    if (this.editing) this.saveButton.disabled = !this.view.online() || this.card.isBusy(this.view.entryId, "set_filament");
+  }
+
+  _paintUnits(system) {
+    const units = system.units || [];
+    const seenSpools = new Set();
+    const seenUnits = new Set();
+    const sections = [];
+    for (const unit of units) {
+      // Units and spools are kept, not rebuilt: moving a focused spool would drop
+      // the keyboard focus on every reading.
+      let parts = this.unitNodes.get(unit.unit);
+      if (!parts) {
+        const section = el("div", "fd-unit");
+        const head = el("div", "fd-unit-head");
+        const grid = el("div", "fd-spools");
+        section.append(head, grid);
+        parts = { section, head, grid };
+        this.unitNodes.set(unit.unit, parts);
+      }
+      seenUnits.add(unit.unit);
+      parts.section.classList.toggle("disconnected", !unit.connected);
+      const name = unit.name || "Unit";
+      const heading = units.length > 1 ? `${name} ${unit.unit + 1}` : name;
+      parts.head.textContent = unit.connected ? heading : `${heading} · disconnected`;
+      const slots = unit.slots || [];
+      const ordered = slots.length === 4 ? FOUR_SLOT_ORDER.map((index) => slots[index]) : slots;
+      const spools = ordered.map((slot) => {
+        const key = slotKey(slot.unit, slot.slot);
+        seenSpools.add(key);
+        return this._spool(key, slot);
+      });
+      replaceChildrenIfChanged(parts.grid, spools);
+      sections.push(parts.section);
+    }
+    for (const key of [...this.spoolNodes.keys()]) if (!seenSpools.has(key)) this.spoolNodes.delete(key);
+    for (const key of [...this.unitNodes.keys()]) if (!seenUnits.has(key)) this.unitNodes.delete(key);
+    replaceChildrenIfChanged(this.unitsEl, sections);
+  }
+
+  _spool(key, slot) {
+    let node = this.spoolNodes.get(key);
+    if (!node) {
+      node = el("button", "spool");
+      node.type = "button";
+      node.dataset.key = key;
+      node.addEventListener("click", () => this.select(key));
+      const number = el("span", "spool-num");
+      const disc = el("span", "spool-disc");
+      const hub = el("span", "spool-hub");
+      const ink = el("span", "spool-ink");
+      disc.append(hub, ink);
+      const name = el("span", "spool-name trunc");
+      const badge = el("span", "spool-badge", "In use");
+      node.append(number, disc, name, badge);
+      node._parts = { number, disc, ink, name, badge };
+      this.spoolNodes.set(key, node);
+    }
+    const { number, disc, ink, name, badge } = node._parts;
+    const color = slot.loaded && slot.color ? slot.color : null;
+    number.textContent = slotLabel(slot.unit, slot.slot);
+    disc.style.background = color || "transparent";
+    disc.classList.toggle("empty", !slot.loaded);
+    ink.textContent = slot.loaded ? slot.material || "?" : "/";
+    ink.style.color = color ? inkFor(color) : "var(--secondary-text-color)";
+    name.textContent = slot.loaded ? slotTitle(slot) : "Empty";
+    badge.hidden = !slot.active;
+    node.classList.toggle("active", Boolean(slot.active));
+    node.classList.toggle("loaded", Boolean(slot.loaded));
+    const selected = key === this.selected;
+    node.classList.toggle("selected", selected);
+    node.setAttribute("aria-pressed", String(selected));
+    const state = slot.active ? "in use" : slot.loaded ? "loaded" : "empty";
+    node.setAttribute("aria-label", `Slot ${slotLabel(slot.unit, slot.slot)}: ${slot.loaded ? slotTitle(slot) : "empty"}, ${state}`);
+    node.disabled = this.editing && !selected;
+    return node;
+  }
+
+  _paintDetail() {
+    const slot = this.slot(this.selected);
+    if (!slot) return;
+    const color = slot.color || null;
+    this.detailSwatch.style.background = color || "transparent";
+    this.detailSwatch.classList.toggle("empty", !color);
+    this.detailName.textContent = `${slotLabel(slot.unit, slot.slot)} · ${slot.loaded ? slotTitle(slot) : "Empty"}`;
+    const state = slot.active ? "In use" : slot.loaded ? "Loaded" : "Empty";
+    this.detailBadge.textContent = state;
+    this.detailBadge.className = `fd-badge ${state.toLowerCase().replace(" ", "-")}`;
+
+    // An empty slot keeps the filament it last held on record, so it is shown as that.
+    const rows = [
+      ["Material", slot.material || "—"],
+      ["Filament", slot.name || "—"],
+      ["Brand", slot.brand || "—"],
+      ["Colour", slot.color || "—"],
+      ["Nozzle", temperatureRange(slot)],
+    ];
+    this.detailRows.replaceChildren();
+    for (const [label, value] of rows) {
+      const term = el("dt", "", slot.loaded ? label : `${label} (last)`);
+      const detail = el("dd", "trunc", value);
+      this.detailRows.append(term, detail);
+    }
+
+    const online = this.view.online();
+    const job = this.view.activeJob();
+    const busy = (command) => this.card.isBusy(this.view.entryId, command);
+    const canLoad = this.can("load_filament");
+    const canUnload = this.can("unload_filament");
+    const canEdit = this.can("set_filament");
+    this.loadButton.hidden = !canLoad;
+    this.loadButton.disabled = !online || job || !slot.loaded || slot.active || busy("load_filament");
+    this.unloadButton.hidden = !canUnload;
+    this.unloadButton.disabled = !online || job || !slot.active || busy("unload_filament");
+    this.editButton.hidden = !canEdit;
+    this.editButton.disabled = !online || job || busy("set_filament");
+    this.actions.hidden = !canLoad && !canUnload && !canEdit;
+
+    let note = "";
+    if (!canLoad && !canUnload && !canEdit) {
+      note = "This printer reports what is in each slot. Loading, unloading and changing a slot are done on its own screen.";
+    } else if (!online) {
+      note = "The printer is not answering.";
+    } else if (job) {
+      note = "The slots cannot be changed while the printer is busy.";
+    } else if (!slot.loaded && canLoad) {
+      note = "Put a spool in this slot to load it.";
+    } else {
+      note = "Select a slot, then load or unload it.";
+    }
+    this.noteEl.textContent = note;
+  }
+
+  _paintRefill(system) {
+    const known = system.auto_refill === true || system.auto_refill === false;
+    this.footEl.hidden = !known;
+    if (!known) return;
+    const settable = this.can("set_auto_refill");
+    this.refillInput.hidden = !settable;
+    this.refillText.hidden = settable;
+    this.refillText.textContent = system.auto_refill ? "On" : "Off";
+    if (settable && this.card.shadowRoot?.activeElement !== this.refillInput) {
+      this.refillInput.checked = Boolean(system.auto_refill);
+    }
+    this.refillInput.disabled = !this.view.online() || this.card.isBusy(this.view.entryId, "set_auto_refill");
   }
 }
 
@@ -398,6 +996,10 @@ class PrinterView {
     this.stateEl = el("div", "state");
     header.appendChild(this.stateEl);
 
+    this.filamentButton = button("icon-btn filament-toggle", "Filament", "nozzle");
+    this.filamentButton.addEventListener("click", () => this.filament.open());
+    header.appendChild(this.filamentButton);
+
     this.lightButton = button("icon-btn light-toggle", "Light", "light", "set_light");
     this.lightButton.addEventListener("click", () => {
       const on = (this.snapshot.lights || []).includes("chamber");
@@ -445,6 +1047,8 @@ class PrinterView {
 
     this.footer = el("div", "footer");
     root.appendChild(this.footer);
+    this.filament = new FilamentDialog(this);
+    root.appendChild(this.filament.node);
     this.selectTab("status");
     return root;
   }
@@ -475,6 +1079,9 @@ class PrinterView {
     this.statsEl = el("div", "stats");
     this.jobEl = el("div", "job");
     this.tempsEl = el("div", "temps");
+    this.filamentStrip = el("button", "filament-strip");
+    this.filamentStrip.type = "button";
+    this.filamentStrip.addEventListener("click", () => this.filament.open());
     this.fansReadout = el("div", "fans-readout");
 
     this.jobControls = el("div", "controls");
@@ -494,6 +1101,7 @@ class PrinterView {
       this.statsEl,
       this.jobEl,
       this.tempsEl,
+      this.filamentStrip,
       this.fansReadout,
       this.jobControls,
     );
@@ -885,6 +1493,7 @@ class PrinterView {
 
     this._updateCamera();
     this._updateStatus();
+    this._updateFilament();
     if (!this.compact) {
       this._updateControls();
       this._updateFilesAvailability();
@@ -1084,6 +1693,42 @@ class PrinterView {
     this.stopButton.hidden = !caps.includes("stop");
     this.stopButton.disabled = !online || !ACTIVE_STATES.has(state) || busy("stop");
     this.jobControls.hidden = !["pause", "resume", "stop"].some((item) => caps.includes(item));
+  }
+
+  /** Return true when the printer reports a multi-material unit with slots. */
+  hasFilament() {
+    const system = this.snapshot.filament;
+    if (!this.capabilities.includes("filament_slots") || !system || this.poweredOff) return false;
+    return (system.units || []).some((unit) => (unit.slots || []).length > 0);
+  }
+
+  _updateFilament() {
+    const shown = this.hasFilament();
+    this.filamentButton.hidden = !shown;
+    this.filamentStrip.hidden = !shown;
+    if (!shown) {
+      this.filament.update();
+      return;
+    }
+    const system = this.snapshot.filament;
+    const active = this.filament.slots().find((slot) => slot.active) || null;
+    this.filamentButton.classList.toggle("on", Boolean(active));
+    const dots = this.filament.slots().map((slot) => {
+      const dot = el("span", "strip-dot");
+      if (slot.loaded && slot.color) dot.style.background = slot.color;
+      dot.classList.toggle("empty", !slot.loaded);
+      dot.classList.toggle("active", Boolean(slot.active));
+      return dot;
+    });
+    const label = system.activity
+      ? system.activity
+      : active
+        ? `${slotTitle(active)} in use, slot ${slotLabel(active.unit, active.slot)}`
+        : "No filament in the nozzle";
+    this.filamentStrip.replaceChildren(icon("nozzle", 16), ...dots, el("span", "strip-label trunc", label));
+    this.filamentStrip.setAttribute("aria-label", `Filament: ${label}. Open the filament panel.`);
+    this.filamentStrip.classList.toggle("working", Boolean(system.activity));
+    this.filament.update();
   }
 
   _updateControls() {
@@ -1806,6 +2451,126 @@ class Generic3DPrinterCard extends HTMLElement {
       .link { display: inline-flex; align-items: center; gap: 4px; color: var(--primary-color); text-decoration: none; }
       .hint { color: var(--secondary-text-color); font-size: 0.8rem; }
       .empty { color: var(--secondary-text-color); font-size: 0.9rem; }
+
+      .filament-toggle.on { color: var(--primary-color); border-color: var(--primary-color); }
+      .filament-strip {
+        display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 10px; box-sizing: border-box;
+        padding: 7px 10px; border-radius: 10px; border: 1px solid var(--divider-color, #e0e0e0);
+        background: transparent; color: var(--secondary-text-color); cursor: pointer; font-size: 0.82rem; text-align: left;
+      }
+      .filament-strip:hover { background: var(--secondary-background-color, #f5f5f5); }
+      .filament-strip.working { border-color: var(--warning-color, #ff9800); }
+      .strip-dot {
+        width: 14px; height: 14px; border-radius: 50%; flex: 0 0 auto; box-sizing: border-box;
+        border: 1px solid rgba(127, 127, 127, 0.55);
+      }
+      .strip-dot.empty { background: transparent; border-style: dashed; }
+      .strip-dot.active { box-shadow: 0 0 0 2px var(--card-background-color, #fff), 0 0 0 4px var(--success-color, #43a047); }
+      .strip-label { flex: 1 1 auto; margin-left: 4px; color: var(--primary-text-color); }
+
+      .filament-dialog {
+        padding: 0; border: none; border-radius: 16px; box-sizing: border-box;
+        width: min(660px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+        background: var(--ha-card-background, var(--card-background-color, #fff)); color: var(--primary-text-color);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); font-family: inherit;
+      }
+      .filament-dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+      .fd-body { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 14px; }
+      .fd-head { display: flex; align-items: center; gap: 10px; color: var(--primary-color); }
+      .fd-titles { flex: 1 1 auto; min-width: 0; color: var(--primary-text-color); }
+      .fd-title { font-size: 1.1rem; font-weight: 600; }
+      .fd-subtitle { font-size: 0.8rem; color: var(--secondary-text-color); }
+      .fd-activity {
+        padding: 8px 12px; border-radius: 10px; font-weight: 600; font-size: 0.88rem;
+        background: rgba(255, 152, 0, 0.12); color: var(--warning-color, #ff9800);
+      }
+      .fd-main { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+      @media (max-width: 580px) { .fd-main { grid-template-columns: minmax(0, 1fr); } }
+      .fd-units { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+      .fd-unit {
+        padding: 12px; border-radius: 14px; background: var(--secondary-background-color, #f2f2f2);
+        border: 1px solid var(--divider-color, #e0e0e0);
+      }
+      .fd-unit.disconnected { opacity: 0.55; }
+      .fd-unit-head {
+        font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+        color: var(--secondary-text-color); margin-bottom: 10px;
+      }
+      .fd-spools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .spool {
+        position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0;
+        padding: 12px 6px 8px; border-radius: 12px; border: 2px solid transparent; font: inherit;
+        background: var(--card-background-color, #fff); color: var(--primary-text-color); cursor: pointer;
+      }
+      .spool:hover:not(:disabled) { border-color: var(--divider-color, #e0e0e0); }
+      .spool.selected, .spool.selected:hover { border-color: var(--primary-color); }
+      .spool:disabled { opacity: 0.45; cursor: default; }
+      .spool-num { position: absolute; top: 6px; left: 9px; font-size: 0.72rem; font-weight: 700; color: var(--secondary-text-color); }
+      .spool-disc {
+        position: relative; width: 64px; height: 64px; border-radius: 50%; box-sizing: border-box;
+        border: 4px solid rgba(127, 127, 127, 0.35);
+      }
+      .spool-disc.empty { border-style: dashed; }
+      .spool-hub {
+        position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; margin: -10px 0 0 -10px; box-sizing: border-box;
+        border-radius: 50%; background: var(--card-background-color, #fff); border: 2px solid rgba(127, 127, 127, 0.35);
+      }
+      .spool-ink {
+        position: absolute; bottom: 6px; left: 2px; right: 2px; text-align: center;
+        font-size: 0.6rem; font-weight: 800; letter-spacing: 0.02em; overflow: hidden; white-space: nowrap;
+      }
+      .spool.active .spool-disc {
+        box-shadow: 0 0 0 3px var(--card-background-color, #fff), 0 0 0 5px var(--success-color, #43a047);
+      }
+      .spool-name { max-width: 100%; font-size: 0.8rem; font-weight: 600; }
+      .spool-badge {
+        font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+        color: var(--success-color, #43a047);
+      }
+      .fd-side { min-width: 0; }
+      .fd-detail-head { display: flex; align-items: center; gap: 10px; }
+      .fd-swatch {
+        width: 22px; height: 22px; border-radius: 50%; flex: 0 0 auto; box-sizing: border-box;
+        border: 1px solid rgba(127, 127, 127, 0.55);
+      }
+      .fd-swatch.empty { background: transparent; border-style: dashed; }
+      .fd-detail-name { flex: 1 1 auto; font-weight: 600; font-size: 1rem; }
+      .fd-badge {
+        flex: 0 0 auto; font-size: 0.68rem; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+        text-transform: uppercase; letter-spacing: 0.04em;
+        background: var(--secondary-background-color, #f2f2f2); color: var(--secondary-text-color);
+      }
+      .fd-badge.in-use { background: rgba(67, 160, 71, 0.15); color: var(--success-color, #43a047); }
+      .fd-badge.loaded { color: var(--primary-color); }
+      .fd-rows { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; margin: 12px 0; font-size: 0.86rem; }
+      .fd-rows dt { color: var(--secondary-text-color); }
+      .fd-rows dd { margin: 0; font-weight: 600; }
+      .fd-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .fd-note { margin-top: 10px; }
+      .fd-foot {
+        display: flex; align-items: center; gap: 8px; padding-top: 12px; font-size: 0.88rem;
+        border-top: 1px solid var(--divider-color, #e0e0e0); color: var(--secondary-text-color);
+      }
+      .fd-refill-label { flex: 1 1 auto; color: var(--primary-text-color); }
+      .fd-refill { width: 18px; height: 18px; margin: 0; accent-color: var(--primary-color); }
+      .fd-refill-text { font-weight: 600; color: var(--primary-text-color); }
+      .fd-form { display: flex; flex-direction: column; gap: 10px; }
+      .fd-form-title { font-weight: 600; }
+      .fd-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; color: var(--secondary-text-color); }
+      .fd-input {
+        padding: 7px 8px; border-radius: 8px; border: 1px solid var(--divider-color, #ccc); min-width: 0;
+        background: var(--card-background-color, #fff); color: var(--primary-text-color); font: inherit; font-size: 0.9rem;
+      }
+      .fd-color-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .fd-color {
+        width: 40px; height: 32px; padding: 0; border: 1px solid var(--divider-color, #ccc); border-radius: 8px;
+        background: none; cursor: pointer;
+      }
+      .fd-swatches { display: flex; flex-wrap: wrap; gap: 5px; }
+      .fd-swatch-btn { width: 20px; height: 20px; border-radius: 50%; border: 1px solid rgba(127, 127, 127, 0.6); padding: 0; cursor: pointer; }
+      .fd-swatch-btn .label { display: none; }
+      .fd-temps { display: flex; align-items: center; gap: 6px; color: var(--primary-text-color); }
+      .fd-temp { width: 64px; text-align: center; }
       @container (max-width: 420px) {
         .heater { grid-template-columns: 1fr; }
         .heater-controls { justify-content: flex-start; }

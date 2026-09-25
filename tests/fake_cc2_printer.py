@@ -8,7 +8,10 @@ uses, with the behaviours that matter most:
   nothing at all, which is what a live printer did;
 * a resume is acknowledged only once the print has resumed, which on hardware
   takes minutes, so the fake never acknowledges it;
-* status pushes are deltas numbered in sequence, merged into the full status.
+* status pushes are deltas numbered in sequence, merged into the full status;
+* a CANVAS with four trays answers methods 2001 to 2005 the way Elegoo's own page
+  expects: loading a tray makes it the active one, unloading clears it, 2003
+  records a tray's filament and 2004 switches auto-refill.
 """
 
 from __future__ import annotations
@@ -84,6 +87,62 @@ FULL_STATUS: dict[str, Any] = {
     "external_device": {"camera": True, "type": "0303", "u_disk": False},
 }
 
+#: The reply to method 2005 of a Centauri Carbon 2 with a CANVAS, as the community
+#: recorded it from a real printer: tray 4 is feeding the nozzle.
+CANVAS_INFO: dict[str, Any] = {
+    "active_canvas_id": 0,
+    "active_tray_id": 3,
+    "auto_refill": False,
+    "canvas_list": [
+        {
+            "canvas_id": 0,
+            "connected": 1,
+            "tray_list": [
+                {
+                    "tray_id": 0,
+                    "brand": "ELEGOO",
+                    "filament_type": "PLA",
+                    "filament_name": "PLA",
+                    "filament_color": "#2850DF",
+                    "min_nozzle_temp": 190,
+                    "max_nozzle_temp": 230,
+                    "status": 1,
+                },
+                {
+                    "tray_id": 1,
+                    "brand": "ELEGOO",
+                    "filament_type": "PLA",
+                    "filament_name": "PLA Basic",
+                    "filament_color": "#FFFFFF",
+                    "min_nozzle_temp": 190,
+                    "max_nozzle_temp": 230,
+                    "status": 0,
+                },
+                {
+                    "tray_id": 2,
+                    "brand": "ELEGOO",
+                    "filament_type": "PLA",
+                    "filament_name": "PLA Silk",
+                    "filament_color": "#F32FF8",
+                    "min_nozzle_temp": 190,
+                    "max_nozzle_temp": 230,
+                    "status": 1,
+                },
+                {
+                    "tray_id": 3,
+                    "brand": "ELEGOO",
+                    "filament_type": "PLA",
+                    "filament_name": "PLA",
+                    "filament_color": "#000000",
+                    "min_nozzle_temp": 190,
+                    "max_nozzle_temp": 230,
+                    "status": 2,
+                },
+            ],
+        }
+    ],
+}
+
 ATTRIBUTES: dict[str, Any] = {
     "hostname": "CC2 QAZJ",
     "machine_model": "Centauri Carbon 2",
@@ -124,6 +183,8 @@ class FakeCC2Printer:
         self.answering = True
         self.status = copy.deepcopy(FULL_STATUS)
         self.attributes = copy.deepcopy(ATTRIBUTES)
+        #: ``None`` is a printer with no CANVAS attached, which lists no unit.
+        self.canvas: dict[str, Any] | None = copy.deepcopy(CANVAS_INFO)
         self.files: list[dict[str, Any]] = [
             {"filename": "benchy.gcode", "type": "file", "size": 1234567, "create_time": 1706900000},
             {"filename": "models", "type": "folder"},
@@ -294,6 +355,8 @@ class FakeCC2Printer:
             return
         self.requests.append(message)
         method = int(message["method"])
+        if method not in self.refuse:
+            self._canvas_command(method, message.get("params") or {})
         if method in self.silent:
             return
         await self.deliver(
@@ -314,7 +377,46 @@ class FakeCC2Printer:
             return {"error_code": 0, "url": f"http://127.0.0.1:{self.camera_port}/?action=stream"}
         if method == 1044:
             return {"error_code": 0, "file_list": self.files, "offset": 0, "total": len(self.files)}
+        if method == 2005:
+            info = self.canvas if self.canvas is not None else {"canvas_list": []}
+            return {"error_code": 0, "canvas_info": copy.deepcopy(info)}
         return {"error_code": 0}
+
+    def tray(self, tray_id: int) -> dict[str, Any]:
+        """Return one tray of the first CANVAS."""
+        assert self.canvas is not None
+        return self.canvas["canvas_list"][0]["tray_list"][tray_id]
+
+    def _canvas_command(self, method: int, params: dict[str, Any]) -> None:
+        """Change the CANVAS the way a load, an unload, an edit or auto-refill does."""
+        if self.canvas is None or method not in (2001, 2002, 2003, 2004):
+            return
+        if method == 2004:
+            self.canvas["auto_refill"] = bool(params.get("auto_refill"))
+            return
+        tray = self.tray(int(params["tray_id"]))
+        if method == 2001:
+            for other in self.canvas["canvas_list"][0]["tray_list"]:
+                if other["status"] == 2:
+                    other["status"] = 1
+            tray["status"] = 2
+            self.canvas["active_canvas_id"] = int(params["canvas_id"])
+            self.canvas["active_tray_id"] = int(params["tray_id"])
+        elif method == 2002:
+            tray["status"] = 1
+            self.canvas["active_tray_id"] = -1
+        elif method == 2003:
+            tray.update(
+                {
+                    "brand": params["brand"],
+                    "filament_type": params["filament_type"],
+                    "filament_name": params["filament_name"],
+                    "filament_code": params["filament_code"],
+                    "filament_color": params["filament_color"],
+                    "min_nozzle_temp": params["filament_min_temp"],
+                    "max_nozzle_temp": params["filament_max_temp"],
+                }
+            )
 
     async def push_delta(self, delta: dict[str, Any], *, sequence: int | None = None) -> None:
         """Merge a delta into the status and push it, as the printer does on a change."""

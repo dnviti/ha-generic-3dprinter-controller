@@ -162,6 +162,7 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
                     Capability.FILE_DELETE,
                     Capability.CAMERA,
                     Capability.WEB_UI,
+                    Capability.FILAMENT_SLOTS,
                 }
             ),
             fields=("port", "camera_port"),
@@ -169,13 +170,24 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
             unsafe=(_UNSAFE_SDCP_START_PRINT,),
             evidence={
                 "verified": (
-                    "commands 0, 1, 258, 320 answered a live Centauri Carbon on "
-                    "firmware V1.4.49; the camera streamed multipart JPEG from port 3031"
+                    "commands 0, 1, 258, 320 and 324 answered a live Centauri Carbon on "
+                    "firmware V1.4.49; 324 returned a connected CANVAS with four trays; "
+                    "the camera streamed multipart JPEG from port 3031. The printer "
+                    "closed a client that sent nothing after 61 seconds and kept one "
+                    "that sent the page's text ping every 30 seconds, and pushed its "
+                    "status only in reply to command 0 or a ping"
                 ),
                 "inferred": (
-                    "commands 128, 129, 130, 131, 259, 386 and the four 403 payload "
-                    "variants come from the pycentauri field notes and Elegoo's SDK, "
-                    "and were not sent to hardware by this project"
+                    "commands 128, 129, 130, 131, 259 and the four 403 payload variants "
+                    "come from the pycentauri field notes and Elegoo's SDK, and were "
+                    "not sent to hardware by this project. Command 386 is the one the "
+                    "printer's page sends to switch its camera on; its effect after a "
+                    "power cycle was reported by a user"
+                ),
+                "absent": (
+                    "loading, unloading and editing a CANVAS slot: the printer's own "
+                    "page on V1.4.49 reads the CANVAS with 324 and sends no command "
+                    "for them, and an unknown command crashes this printer"
                 ),
             },
             family="elegoo_centauri",
@@ -207,6 +219,11 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
                     Capability.FILE_LIST,
                     Capability.FILE_UPLOAD,
                     Capability.CAMERA,
+                    Capability.FILAMENT_SLOTS,
+                    Capability.LOAD_FILAMENT,
+                    Capability.UNLOAD_FILAMENT,
+                    Capability.SET_FILAMENT,
+                    Capability.SET_AUTO_REFILL,
                 }
             ),
             fields=("port", "camera_port", "serial"),
@@ -227,7 +244,10 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
                     "methods 1020, 1021, 1022 and 1023, and 1031 during a print, need a "
                     "print in progress and were not sent; they come from Elegoo's "
                     "elegoo-link SDK and from community clients measured on the same "
-                    "firmware"
+                    "firmware. The CANVAS methods 2001 to 2005 come from the community "
+                    "elegoo-web project, which recorded Elegoo's own page, and from the "
+                    "SDK for 2004 and 2005; the Centauri Carbon's 324 answer has the "
+                    "same shape as 2005's"
                 ),
             },
             family="elegoo_centauri",

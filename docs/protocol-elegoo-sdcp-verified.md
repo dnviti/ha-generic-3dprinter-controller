@@ -67,7 +67,7 @@ topics were observed:
 
 | Topic | Carries |
 | --- | --- |
-| `sdcp/status/<mainboard-id>` | the `Status` object, pushed on change and in reply to `Cmd` 0 |
+| `sdcp/status/<mainboard-id>` | the `Status` object, in reply to `Cmd` 0 and to the text `ping` |
 | `sdcp/attributes/<mainboard-id>` | the `Attributes` object, in reply to `Cmd` 1 |
 | `sdcp/response/<mainboard-id>` | the `Ack` for a command, and command payloads such as the file list |
 | `sdcp/error/<mainboard-id>` | errors; named in the printer's own UI code |
@@ -90,6 +90,68 @@ An acknowledgement looks like this. `Ack` 0 is success.
 
 Command payloads can arrive on a later frame than the acknowledgement. The file
 list does: the `Ack` frame and the `FileList` frame are separate messages.
+
+### Keeping the socket
+
+The printer's own page opens the socket, sends `Cmd` 0, 1, 320, 134 and 258, and
+then sends the plain text `ping` every 30 seconds. The printer holds a client to
+that. Measured on 2026-09-25 with two sockets opened side by side on an idle
+printer, each sending `Cmd` 1 once:
+
+| Socket | Closed by the printer | Status frames received |
+| --- | --- | --- |
+| sends nothing more | after 61 s, close code 1006 | 1 in 61 s |
+| sends `ping` every 30 s | no, still open at 150 s | 5 in 150 s |
+
+The printer never answers `ping` with text. It answers it, often but not every time,
+with a status push, and it pushes its status otherwise only in reply to `Cmd` 0.
+Attributes are pushed every few seconds while a client is connected.
+
+This is why a client that does not ping sees the socket close every minute, and why
+a client that caches the status it had before the printer was switched off keeps
+reporting it: nothing new arrives unless it is asked for. The adapter therefore
+pings every 30 seconds, sends `Cmd` 0 on every connection and when its status is
+more than 20 seconds old, and treats a socket that has carried nothing for 75
+seconds as dead. With that, it held one socket for 100 seconds without a reconnect
+on the same printer.
+
+### The CANVAS
+
+`Cmd` 324 returns the CANVAS attached to the printer. The printer's page sends it
+with an empty `Data` before it shows the slots, and the answer arrives on
+`sdcp/response`:
+
+```json
+{
+  "active_canvas_id": 0,
+  "active_tray_id": -1,
+  "auto_refill": 1,
+  "canvas_list": [
+    {
+      "canvas_id": 0,
+      "connected": 1,
+      "tray_list": [
+        {
+          "tray_id": 0, "brand": "Generic", "filament_type": "PETG",
+          "filament_name": "PETG PRO", "filament_code": "0x00000",
+          "filament_color": "#000000", "min_nozzle_temp": 230,
+          "max_nozzle_temp": 260, "status": 0
+        }
+      ]
+    }
+  ],
+  "Ack": 0
+}
+```
+
+Four trays came back; one is shown. `status` is 0 for an empty tray and 1 for a
+loaded one, and an empty tray keeps the filament it last held on record.
+`active_tray_id` is -1 while nothing is in the nozzle. The status object carries
+`AmsConnectStatus`, 1 while a CANVAS is attached, and the adapter sends `Cmd` 324
+only then.
+
+The page on this firmware sends no command to load, unload or edit a tray. Those
+are done on the printer's screen.
 
 ### Command codes
 
@@ -117,8 +179,8 @@ below is either marked verified against this printer or unverified.
 | 321 | `GET_PRINTER_TASK_DETAIL` | no |
 | 322 | `DELETE_PRINTER_HISTORY` | no |
 | 323 | `GET_PRINTER_HISTORY_VIDEO` | no |
-| 324 | `GET_MATERIAL_DATA` | queried, no reply observed |
-| 386 | `EDIT_PRINTER_VIDEO_STREAMING` | no, and not needed, see the camera section |
+| 324 | `GET_MATERIAL_DATA` | yes, returns the CANVAS, see above |
+| 386 | `EDIT_PRINTER_VIDEO_STREAMING` | sent by the page before it shows the camera; see the camera section |
 | 387 | `EDIT_PRINTER_TIME_LAPSE_STATUS` | no |
 | 401 | `EDIT_PRINTER_AXIS_NUMBER` | no |
 | 402 | `EDIT_PRINTER_AXIS_ZERO` | no |
@@ -269,8 +331,12 @@ Confirmed live:
 | Bytes in 6 seconds | 2.7 MB, so roughly 45 KB per frame |
 | Auth | none |
 
-No WebSocket command is required to start the stream. `CameraStatus` is 1 in the
-attributes, and `EDIT_PRINTER_VIDEO_STREAMING` (386) was never sent.
+During the first probing the stream answered without any command. After a power
+cycle, though, the camera stayed dark until the printer's page had been opened, and
+the page sends `EDIT_PRINTER_VIDEO_STREAMING` (386) with `{"Enable": 1}` before it
+shows the camera, reading `VideoUrl` from the answer. The adapter sends the same
+request once per connection before it reads the camera, and again after the camera
+failed.
 
 A frame is extracted by reading bytes until the JPEG start-of-image marker
 `FF D8` and then until the end-of-image marker `FF D9`. Do not trust
@@ -285,8 +351,8 @@ These are open, and the integration must degrade rather than assume:
 * The maximum upload size, and the exact multipart field set for
   `POST /uploadFile/upload`. The route is reported by third-party sources and was
   not exercised here, because uploading to a printer mid-print is not safe.
-* Whether the push scheduler can wedge on this firmware. The printer pushed
-  status continuously during probing, so polling was not needed to observe state.
+* What `Cmd` 386 answers on a cold start. The request is the page's own; its
+  effect after a power cycle has been reported by a user, not yet measured here.
 * The meaning of `PrintInfo.Status` 13. The printer was printing, so bits are in
   use; the full enumeration is not documented for this firmware.
 

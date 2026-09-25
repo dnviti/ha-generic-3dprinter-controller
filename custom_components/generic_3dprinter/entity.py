@@ -8,19 +8,27 @@ left sitting at ``unavailable`` for the lifetime of the entry.
 
 Every entity reads the same coordinator-owned :class:`PrinterSnapshot`, so a
 printer is polled once per interval no matter how many entities it carries.
+
+A multi-material unit is the one thing a capability cannot settle at setup: the
+protocol can report one, but whether a unit is attached, and how many slots it
+has, is only known once the printer answers. Its entities are therefore added
+when the printer first reports them, by :func:`async_follow_filament`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DATA_COORDINATORS, DOMAIN, MANUFACTURER, Capability
 from .coordinator import PrinterCoordinator
+from .models import FilamentSystem
 from .protocols import PrinterConfig
 from .runtime import PrinterRuntime
 
@@ -109,3 +117,37 @@ class Generic3DPrinterEntity(CoordinatorEntity[PrinterCoordinator]):
     def available(self) -> bool:
         """Return ``False`` while the coordinator's last poll failed."""
         return self.coordinator.last_update_success
+
+
+type FilamentEntityFactories = Mapping[str, Callable[[], Entity]]
+
+
+@callback
+def async_follow_filament(
+    entry: ConfigEntry,
+    coordinator: PrinterCoordinator,
+    async_add_entities: AddEntitiesCallback,
+    build: Callable[[FilamentSystem], FilamentEntityFactories],
+) -> None:
+    """Add a platform's filament entities as the printer first reports them.
+
+    ``build`` maps each entity the current system calls for to a factory, keyed by
+    something stable such as the slot. A key is built once: a slot that stops being
+    reported keeps its entity, which then reads ``None``, rather than the entity
+    being removed and its history lost when a unit is unplugged for a moment.
+    """
+    known: set[str] = set()
+
+    @callback
+    def _add_new() -> None:
+        snapshot = coordinator.data
+        filament = snapshot.filament if snapshot is not None else None
+        if filament is None:
+            return
+        fresh = {key: factory for key, factory in build(filament).items() if key not in known}
+        if fresh:
+            known.update(fresh)
+            async_add_entities([factory() for factory in fresh.values()])
+
+    _add_new()
+    entry.async_on_unload(coordinator.async_add_listener(_add_new))

@@ -20,10 +20,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import Capability, Command, LightChannel
 from .coordinator import PrinterCoordinator
 from .entity import (
+    FilamentEntityFactories,
     Generic3DPrinterEntity,
+    async_follow_filament,
     async_require_coordinator,
     granted_capabilities,
 )
+from .models import FilamentSystem
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -47,14 +50,22 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create the lights this printer's capabilities allow."""
-    if not granted_capabilities(entry.runtime_data)[Capability.SET_LIGHT]:
-        return
+    """Create the lights and settings this printer's capabilities allow."""
+    granted = granted_capabilities(entry.runtime_data)
     coordinator = async_require_coordinator(hass, entry.entry_id)
-    async_add_entities(
-        Generic3DPrinterSwitch(coordinator, description)
-        for description in SWITCH_DESCRIPTIONS
-    )
+    if granted[Capability.SET_LIGHT]:
+        async_add_entities(
+            Generic3DPrinterSwitch(coordinator, description)
+            for description in SWITCH_DESCRIPTIONS
+        )
+    if granted[Capability.SET_AUTO_REFILL]:
+
+        def build(filament: FilamentSystem) -> FilamentEntityFactories:
+            if filament.auto_refill is None:
+                return {}
+            return {"auto_refill": lambda: AutoRefillSwitch(coordinator)}
+
+        async_follow_filament(entry, coordinator, async_add_entities, build)
 
 
 class Generic3DPrinterSwitch(Generic3DPrinterEntity, SwitchEntity):
@@ -88,3 +99,26 @@ class Generic3DPrinterSwitch(Generic3DPrinterEntity, SwitchEntity):
         await self.coordinator.async_send_command(
             Command.SET_LIGHT, on=on, channel=self.entity_description.channel.value
         )
+
+
+class AutoRefillSwitch(Generic3DPrinterEntity, SwitchEntity):
+    """Whether the multi-material unit switches to a matching slot when one runs out."""
+
+    def __init__(self, coordinator: PrinterCoordinator) -> None:
+        """Bind the switch to the printer's multi-material system."""
+        super().__init__(coordinator, "auto_refill")
+        self.entity_description = SwitchEntityDescription(key="auto_refill", icon="mdi:autorenew")
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the setting the printer reports."""
+        filament = self.coordinator.data.filament
+        return filament.auto_refill if filament is not None else None
+
+    async def async_turn_on(self, **kwargs: object) -> None:
+        """Turn auto-refill on."""
+        await self.coordinator.async_send_command(Command.SET_AUTO_REFILL, on=True)
+
+    async def async_turn_off(self, **kwargs: object) -> None:
+        """Turn auto-refill off."""
+        await self.coordinator.async_send_command(Command.SET_AUTO_REFILL, on=False)

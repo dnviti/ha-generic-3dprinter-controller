@@ -37,6 +37,11 @@ factor, flow factor and fan duty as numbers; the chamber light as a switch. Each
 one exists only when the printer says it supports it. The card adds a joystick,
 temperature presets, and file upload, print and delete on top.
 
+**Filament.** A printer with a multi-material unit, such as Elegoo's CANVAS, gets
+a sensor per slot with the filament's name, material, brand, colour and nozzle
+range, a sensor for the filament in use, and an auto-refill switch where the printer
+can be told. The card shows the unit in a popup of its own.
+
 **Camera.** A live MJPEG stream, not a slideshow. The card and Home Assistant's own
 camera proxy both read from one shared upstream connection per printer, so a
 dashboard tile, the card and a notification do not each open their own. That
@@ -180,6 +185,27 @@ One printer gets three tabs:
 * **Files**: the printer's files, with print and delete where the printer allows
   them, and an upload that can start the print once the file is on the printer.
 
+**Filament.** A printer with a multi-material unit gets a filament button in the
+header and a strip on the Status tab: one dot per slot in its filament's colour, and
+the filament in use. Either opens a popup that draws the unit the way it stands,
+four spools numbered as on the unit, with the slot in use marked. Selecting a slot
+shows its material, brand, colour and nozzle range, and the buttons the printer
+allows:
+
+* **Load** feeds a loaded slot into the nozzle, and **Unload** pulls the one in use
+  back. Both ask first, and both are off while the printer is busy.
+* **Edit** records which filament is in a slot: brand, filament from the printer's
+  own list, colour and nozzle range.
+* **Auto-refill** switches to a matching slot when one runs out.
+
+While the unit works, the popup and the strip say what it is doing, such as
+"Loading: heating the nozzle". What each printer allows:
+
+| Printer | Reads the slots | Load, unload, edit, auto-refill |
+| --- | --- | --- |
+| Centauri Carbon 2 with a CANVAS | yes | yes |
+| Centauri Carbon with a CANVAS | yes | no: its firmware offers no command for them over the network, so use its screen |
+
 The header carries the chamber light and, with `power_entity`, a power button.
 Switching a printer off always asks first, and says so plainly when it is printing
 or its nozzle is still hot, because cutting the power stops the fan that cools it.
@@ -221,6 +247,18 @@ automation:
           entity_id: button.centauri_carbon_pause
 ```
 
+```yaml
+  - alias: Tell me when a CANVAS slot runs empty
+    triggers:
+      - trigger: state
+        entity_id: sensor.centauri_carbon_2_filament_slot_1
+        to: empty
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          message: Slot 1 of the CANVAS is empty.
+```
+
 ## Troubleshooting
 
 **The printer is unreachable.** Confirm the address and that Home Assistant can
@@ -241,9 +279,13 @@ mode (see above): in cloud mode it takes the connection and never answers, and t
 integration says so. A refused access code is reported as such. "No free client
 slot" means the slicer, the phone app and other clients hold them all.
 
-**Status stops updating while the printer is idle.** On some SDCP firmware the
-push scheduler wedges while idle. The adapter requests status explicitly instead of
-waiting for a push, so this recovers on the next poll.
+**A Centauri Carbon stops answering after a power cycle until its web page is
+opened.** Fixed in 0.5.0. Measured on the printer: it closes a client that does not
+send the text `ping` its own page sends every 30 seconds, it pushes its status only
+when asked, and after a power cycle its camera stays off until something switches it
+on. The integration now does what the page does: it pings, it asks for the status on
+every connection and whenever the last one is more than 20 seconds old, and it
+switches the camera on with command 386 before reading it.
 
 **Entity names look generic.** Confirm `translations/en.json` shipped with the
 component. Entity names come from there, not from `strings.json`.

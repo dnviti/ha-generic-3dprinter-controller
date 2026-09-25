@@ -52,6 +52,10 @@ COMMAND_CAPABILITY: Final[Mapping[Command, Capability]] = MappingProxyType(
         Command.HOME: Capability.HOME,
         Command.JOG: Capability.JOG,
         Command.DELETE_FILE: Capability.FILE_DELETE,
+        Command.LOAD_FILAMENT: Capability.LOAD_FILAMENT,
+        Command.UNLOAD_FILAMENT: Capability.UNLOAD_FILAMENT,
+        Command.SET_FILAMENT: Capability.SET_FILAMENT,
+        Command.SET_AUTO_REFILL: Capability.SET_AUTO_REFILL,
     }
 )
 
@@ -348,6 +352,16 @@ class Protocol(ABC):
     def unsafe_features(self) -> tuple[UnsafeFeature, ...]:
         """Return the hazards this protocol declares."""
         return self._unsafe
+
+    @property
+    def filament_presets(self) -> tuple[Mapping[str, Any], ...]:
+        """Return the filaments the card offers when a slot's filament is set.
+
+        Each is ``material``, ``name``, ``min_temp``, ``max_temp`` and ``brands``.
+        Empty unless the printer can record a slot's filament and keeps a list of
+        its own; the card then asks for the material in words.
+        """
+        return ()
 
     @classmethod
     async def async_prepare_config(cls, config: PrinterConfig) -> PrinterConfig:

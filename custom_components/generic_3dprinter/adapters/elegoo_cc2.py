@@ -30,6 +30,11 @@ Three facts shape the adapter more than any other.
   which is the Centauri Carbon's failure mode. The hazard model is therefore
   different, but the rule is the same: only methods whose payload has a source are
   sent, and starting a print stays behind an opt-in.
+
+A CANVAS multi-material unit is read with method 2005 and driven with 2001 to load
+a slot, 2002 to unload it, 2003 to record its filament and 2004 for auto-refill.
+The numbers and payloads are the ones Elegoo's own page sends, as the community
+elegoo-web project recorded them.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ from ..models import (
     Celsius,
     Fans,
     FileEntry,
+    FilamentSystem,
     Millimetres,
     Percent,
     PrinterSnapshot,
@@ -72,6 +78,12 @@ from ..protocols import (
     Protocol,
     ProtocolError,
     UnreachableError,
+)
+from .elegoo_canvas import (
+    ACTIVITY_BY_SUB_STATUS,
+    FILAMENT_PRESETS,
+    edit_payload,
+    parse_canvas,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -116,6 +128,9 @@ REQUEST_GAP: Final = 0.5
 FULL_STATUS_INTERVAL: Final = 300.0
 #: Deltas carry a sequence number. This many gaps in a row mean deltas were lost.
 MAX_SEQUENCE_GAPS: Final = 5
+#: How often the CANVAS is read while no status push says it changed. A spool is
+#: swapped by hand, and the printer does not always report that.
+CANVAS_INTERVAL: Final = 60.0
 
 UPLOAD_CHUNK: Final = 1024 * 1024
 UPLOAD_TIMEOUT: Final = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=60)
@@ -139,6 +154,11 @@ METHOD: Final[Mapping[str, int]] = MappingProxyType(
         "set_speed_mode": 1031,
         "video_stream": 1042,
         "file_list": 1044,
+        "load_filament": 2001,
+        "unload_filament": 2002,
+        "set_filament": 2003,
+        "set_auto_refill": 2004,
+        "canvas": 2005,
     }
 )
 
@@ -472,6 +492,12 @@ class ElegooCC2Protocol(Protocol):
         self._sequence_gaps = 0
         self._attributes: dict[str, Any] = {}
         self._video_enabled = False
+        self._canvas: FilamentSystem | None = None
+        self._canvas_at: float | None = None
+        #: Set when a status push mentions the CANVAS, or after a filament command.
+        self._canvas_stale = True
+        #: Cleared when the printer says it does not know method 2005.
+        self._canvas_supported = True
 
     # --------------------------------------------------------------- addresses
 
@@ -745,6 +771,8 @@ class ElegooCC2Protocol(Protocol):
 
         if method == EVENT_STATUS:
             self._apply_delta(_integer(message.get("id")), result)
+            if "canvas_info" in result:
+                self._canvas_stale = True
         elif method == METHOD["status"] and _integer(result.get("error_code")) in (0, None):
             self._apply_full_status(result)
         elif method in (EVENT_ATTRIBUTES, METHOD["attributes"]) and result:
@@ -881,6 +909,7 @@ class ElegooCC2Protocol(Protocol):
         camera = parsed["camera"]
         if camera is None:
             camera = self._attributes.get("camera_connected") is True
+        filament = await self._async_read_canvas(parsed)
 
         return PrinterSnapshot(
             protocol=ProtocolId.ELEGOO_CC2,
@@ -917,6 +946,7 @@ class ElegooCC2Protocol(Protocol):
             homed_axes=parsed["homed_axes"],
             lights=frozenset({LightChannel.CHAMBER}) if parsed["light"] else frozenset(),
             camera=bool(camera),
+            filament=filament,
             model=str(self._attributes.get("machine_model") or "")
             or (self._discovery.model if self._discovery else None)
             or None,
@@ -933,6 +963,46 @@ class ElegooCC2Protocol(Protocol):
     def _firmware(self) -> str | None:
         version = _mapping(self._attributes.get("software_version")).get("ota_version")
         return str(version) if version else None
+
+    async def _async_read_canvas(self, parsed: Mapping[str, Any]) -> FilamentSystem | None:
+        """Return the CANVAS, asking for it again when it may have changed.
+
+        A status push that mentions ``canvas_info`` marks it stale rather than being
+        merged: the push is a delta, and a delta of a list would replace the whole
+        list with the one tray that changed. A printer that does not know method
+        2005 is not asked again. A read that fails keeps the last answer.
+        """
+        if Capability.FILAMENT_SLOTS not in self.capabilities or not self._canvas_supported:
+            return None
+        now = time.monotonic()
+        due = self._canvas_at is None or now - self._canvas_at > CANVAS_INTERVAL
+        if self._canvas_stale or due:
+            try:
+                result = await self._async_send_checked("canvas")
+            except CommandRejectedError as err:
+                if err.code == 1001:
+                    self._canvas_supported = False
+                _LOGGER.debug("%s: the CANVAS was not read: %s", self.config.name, err)
+            except _NoAnswerError as err:
+                _LOGGER.debug("%s: the CANVAS did not answer: %s", self.config.name, err)
+            else:
+                self._canvas = parse_canvas(result.get("canvas_info"))
+                self._canvas_at = now
+                self._canvas_stale = False
+        if self._canvas is None:
+            return None
+        return FilamentSystem(
+            units=self._canvas.units,
+            auto_refill=self._canvas.auto_refill,
+            activity=ACTIVITY_BY_SUB_STATUS.get(parsed["sub_status"] or 0),
+        )
+
+    @property
+    def filament_presets(self) -> tuple[Mapping[str, Any], ...]:
+        """Return the filaments Elegoo's page offers for a slot."""
+        if Capability.SET_FILAMENT not in self.capabilities:
+            return ()
+        return tuple(preset.as_dict() for preset in FILAMENT_PRESETS)
 
     # --------------------------------------------------------------- commands
 
@@ -1038,6 +1108,52 @@ class ElegooCC2Protocol(Protocol):
     async def _async_set_light(self, params: Mapping[str, Any]) -> None:
         """Switch the chamber light with ``power``, the key Elegoo's own web page sends."""
         await self._async_send_checked("set_light", {"power": 1 if params["on"] else 0})
+
+    # --------------------------------------------------------------- filament
+
+    def _require_slot(self, params: Mapping[str, Any]) -> dict[str, int]:
+        """Return the unit and tray a filament command addresses, if the printer has it.
+
+        A tray the printer does not report is refused here: the printer is known to
+        acknowledge a request for a tray that does not exist and act on tray 0.
+        """
+        unit, slot = int(params.get("unit", 0)), int(params["slot"])
+        if self._canvas is not None and self._canvas.slot(unit, slot) is None:
+            raise ProtocolError(f"the CANVAS has no slot {slot + 1} on unit {unit + 1}")
+        return {"canvas_id": unit, "tray_id": slot}
+
+    async def _async_load_filament(self, params: Mapping[str, Any]) -> None:
+        """Feed a slot into the nozzle: the printer heats, cuts the old filament, feeds."""
+        self._require_idle("load filament")
+        target = self._require_slot(params)
+        slot = self._canvas.slot(target["canvas_id"], target["tray_id"]) if self._canvas else None
+        if slot is not None and not slot.loaded:
+            raise ProtocolError(f"slot {slot.slot + 1} is empty")
+        self._canvas_stale = True
+        await self._async_send_unhurried("load_filament", target)
+
+    async def _async_unload_filament(self, params: Mapping[str, Any]) -> None:
+        """Pull a slot's filament back out of the nozzle."""
+        self._require_idle("unload filament")
+        target = self._require_slot(params)
+        self._canvas_stale = True
+        await self._async_send_unhurried("unload_filament", target)
+
+    async def _async_set_filament(self, params: Mapping[str, Any]) -> None:
+        """Record the filament in a slot, in the fields Elegoo's page sends."""
+        self._require_idle("change a slot's filament")
+        target = self._require_slot(params)
+        try:
+            payload = edit_payload({**params, "unit": target["canvas_id"]})
+        except ValueError as err:
+            raise ProtocolError(str(err)) from err
+        self._canvas_stale = True
+        await self._async_send_checked("set_filament", payload)
+
+    async def _async_set_auto_refill(self, params: Mapping[str, Any]) -> None:
+        """Switch auto-refill, with the key both Elegoo's SDK and its page send."""
+        self._canvas_stale = True
+        await self._async_send_checked("set_auto_refill", {"auto_refill": bool(params["on"])})
 
     # ------------------------------------------------------------------ files
 
@@ -1189,5 +1305,9 @@ _DISPATCH: Final[Mapping[Command, Any]] = MappingProxyType(
         Command.SET_LIGHT: ElegooCC2Protocol._async_set_light,
         Command.HOME: ElegooCC2Protocol._async_home,
         Command.JOG: ElegooCC2Protocol._async_jog,
+        Command.LOAD_FILAMENT: ElegooCC2Protocol._async_load_filament,
+        Command.UNLOAD_FILAMENT: ElegooCC2Protocol._async_unload_filament,
+        Command.SET_FILAMENT: ElegooCC2Protocol._async_set_filament,
+        Command.SET_AUTO_REFILL: ElegooCC2Protocol._async_set_auto_refill,
     }
 )

@@ -129,6 +129,10 @@ class PrinterCoordinator(DataUpdateCoordinator[PrinterSnapshot]):
             raise PrinterError(f"the printer is unreachable: {err}") from err
         except ProtocolError as err:
             raise PrinterError(str(err)) from err
+        # Read the printer again, so the card and the entities show what the
+        # command changed now rather than at the next poll. The refresh is
+        # debounced, so a burst of commands still reads the printer once.
+        await self.async_request_refresh()
 
     async def async_list_files(self) -> list[FileEntry]:
         """Refresh and return the printer's stored files."""

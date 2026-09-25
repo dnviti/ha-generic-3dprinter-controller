@@ -141,6 +141,28 @@ These need a print in progress, which was not part of the checks:
 Deliberately not sent: 1047 (delete), because source 3 sends `{"file_path": [...]}`
 while source 2's document gives `{"filename": ...}` and marks it untested.
 
+### The CANVAS
+
+The test printer's CANVAS methods have not been sent here yet. They come from the
+community elegoo-web project, which recorded Elegoo's own page, and from the SDK for
+2004 and 2005:
+
+| Method | Does | Params |
+| --- | --- | --- |
+| 2005 | read the CANVAS | `{}`; answers `{"canvas_info": {...}}` in the shape the Centauri Carbon's `Cmd` 324 returns |
+| 2001 | load a tray into the nozzle | `{"canvas_id": 0, "tray_id": 0-3}` |
+| 2002 | unload a tray | `{"canvas_id": 0, "tray_id": 0-3}` |
+| 2003 | record a tray's filament | `canvas_id`, `tray_id`, `brand`, `filament_type`, `filament_name`, `filament_code`, `filament_color`, `filament_min_temp`, `filament_max_temp` |
+| 2004 | auto-refill | `{"auto_refill": true}` |
+
+A status push may carry `canvas_info`. It is a delta, and a delta of the tray list
+would replace the whole list, so the adapter reads 2005 again instead of merging
+it. While the CANVAS loads or unloads, `machine_status.sub_status` runs through
+1150 to 1158 and 1160 to 1166, which the adapter reports in words. Loading,
+unloading and editing are refused unless the printer is idle, and a tray the
+printer does not report is refused before it is sent, because source 2 found that a
+request for a tray that does not exist is acknowledged and carried out on tray 0.
+
 ### Two findings from source 2 that shape the start of a print
 
 * `printer_check` in the start-print config **persists**: a job that omits it
@@ -159,4 +181,5 @@ not exercise that.
 ## Still to verify
 
 Pause, resume and stop on a test print, a speed mode change during that print, a
-multi-chunk upload, and starting a print once its opt-in is enabled.
+multi-chunk upload, starting a print once its opt-in is enabled, and the CANVAS
+methods 2001 to 2005.

@@ -113,6 +113,105 @@ class FileEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class FilamentSlot:
+    """One slot of a multi-material unit, and the filament recorded for it.
+
+    ``loaded`` says whether a spool is in the slot. The material, name and colour
+    are what the printer has on record for the slot, which it keeps while the slot
+    is empty, so they are reported either way and a reader decides what to show.
+    """
+
+    unit: int
+    slot: int
+    loaded: bool = False
+    #: The slot is feeding the nozzle now.
+    active: bool = False
+    material: str | None = None
+    name: str | None = None
+    brand: str | None = None
+    #: ``#RRGGBB``.
+    color: str | None = None
+    min_temp: Celsius | None = None
+    max_temp: Celsius | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe mapping."""
+        return {
+            "unit": self.unit,
+            "slot": self.slot,
+            "loaded": self.loaded,
+            "active": self.active,
+            "material": self.material,
+            "name": self.name,
+            "brand": self.brand,
+            "color": self.color,
+            "min_temp": self.min_temp,
+            "max_temp": self.max_temp,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FilamentUnit:
+    """One multi-material unit, such as one Elegoo CANVAS, and its slots."""
+
+    unit: int
+    connected: bool = True
+    #: What the unit is called, for a heading. ``None`` when the printer says nothing.
+    name: str | None = None
+    slots: tuple[FilamentSlot, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe mapping."""
+        return {
+            "unit": self.unit,
+            "connected": self.connected,
+            "name": self.name,
+            "slots": [item.as_dict() for item in self.slots],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FilamentSystem:
+    """Every multi-material unit attached to a printer.
+
+    ``None`` on the snapshot means the printer reports no such system, which is
+    different from a system whose units are all disconnected.
+    """
+
+    units: tuple[FilamentUnit, ...] = ()
+    #: Whether the printer switches to a matching slot when one runs out.
+    auto_refill: bool | None = None
+    #: What the system is doing right now, such as loading, in words.
+    activity: str | None = None
+
+    @property
+    def slots(self) -> tuple[FilamentSlot, ...]:
+        """Return every slot of every unit, in order."""
+        return tuple(slot for unit in self.units for slot in unit.slots)
+
+    @property
+    def active(self) -> FilamentSlot | None:
+        """Return the slot feeding the nozzle, if any."""
+        return next((slot for slot in self.slots if slot.active), None)
+
+    def slot(self, unit: int, slot: int) -> FilamentSlot | None:
+        """Return one slot, or ``None`` when the system has no such slot."""
+        return next(
+            (item for item in self.slots if item.unit == unit and item.slot == slot), None
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe mapping."""
+        active = self.active
+        return {
+            "units": [item.as_dict() for item in self.units],
+            "auto_refill": self.auto_refill,
+            "activity": self.activity,
+            "active": {"unit": active.unit, "slot": active.slot} if active else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PrinterSnapshot:
     """One complete, normalised view of a printer at one instant.
 
@@ -149,6 +248,9 @@ class PrinterSnapshot:
 
     # --- camera
     camera: bool = False
+
+    # --- filament
+    filament: FilamentSystem | None = None
 
     # --- provenance
     model: str | None = None
@@ -207,6 +309,7 @@ class PrinterSnapshot:
             "homed_axes": sorted(self.homed_axes),
             "lights": sorted(item.value for item in self.lights),
             "camera": self.camera,
+            "filament": self.filament.as_dict() if self.filament else None,
             "model": self.model,
             "firmware": self.firmware,
             "serial": self.serial,

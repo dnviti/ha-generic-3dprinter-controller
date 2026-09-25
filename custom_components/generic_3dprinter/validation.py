@@ -14,6 +14,7 @@ converts from that into whatever its protocol wants.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -29,6 +30,13 @@ MIN_TEMPERATURE: Final = 0.0
 MAX_PERCENT: Final = 100.0
 MIN_PERCENT: Final = 0.0
 MAX_JOG_MM: Final = 500.0
+#: Units and slots of a multi-material system are numbered from 0. Four units of
+#: four slots is the most any system in this fleet chains; the ceiling leaves room.
+MAX_SLOT_INDEX: Final = 63
+#: Material, brand and filament names are short labels, not free text.
+MAX_LABEL_LENGTH: Final = 40
+
+_COLOR_RE: Final = re.compile(r"#?([0-9A-Fa-f]{6})")
 
 
 class ParamKind(StrEnum):
@@ -41,6 +49,8 @@ class ParamKind(StrEnum):
     AXIS = "axis"
     LIGHT = "light"
     BOOLEAN = "boolean"
+    INDEX = "index"
+    COLOR = "color"
 
 
 class ParamError(ValueError):
@@ -55,6 +65,7 @@ class ParamSpec:
     required: bool = False
     default: Any = None
     choices: tuple[str, ...] = ()
+    max_length: int | None = None
 
     def coerce(self, command: Command, name: str, raw: Any) -> Any:
         """Return the validated, unit-normalised value of ``raw``."""
@@ -62,7 +73,24 @@ class ParamSpec:
         if self.kind is ParamKind.TEXT:
             if not isinstance(raw, str) or not raw.strip():
                 raise ParamError(f"{label} must be a non-empty string")
+            if self.max_length is not None and len(raw.strip()) > self.max_length:
+                raise ParamError(f"{label} must be at most {self.max_length} characters")
             return raw.strip()
+        if self.kind is ParamKind.INDEX:
+            if isinstance(raw, bool):
+                raise ParamError(f"{label} must be a whole number")
+            try:
+                number = float(raw)
+            except (TypeError, ValueError) as err:
+                raise ParamError(f"{label} must be a whole number") from err
+            if not number.is_integer() or not 0 <= number <= MAX_SLOT_INDEX:
+                raise ParamError(f"{label} must be a whole number from 0 to {MAX_SLOT_INDEX}")
+            return int(number)
+        if self.kind is ParamKind.COLOR:
+            match = _COLOR_RE.fullmatch(raw.strip()) if isinstance(raw, str) else None
+            if match is None:
+                raise ParamError(f"{label} must be a colour written as #RRGGBB")
+            return f"#{match.group(1).upper()}"
         if self.kind is ParamKind.BOOLEAN:
             if isinstance(raw, bool):
                 return raw
@@ -104,6 +132,15 @@ _RANGE_BY_KIND: Final[Mapping[ParamKind, tuple[float, float]]] = MappingProxyTyp
 _AXIS_CHOICES: Final = ("X", "Y", "Z")
 _HOME_CHOICES: Final = ("X", "Y", "Z", "XY", "XZ", "YZ", "XYZ")
 _LIGHT_CHOICES: Final = ("chamber", "status", "rgb")
+
+#: Which slot a filament command addresses. The unit defaults to the first, which
+#: is the only one most printers have.
+_SLOT_PARAMS: Final[Mapping[str, ParamSpec]] = MappingProxyType(
+    {
+        "unit": ParamSpec(ParamKind.INDEX, default=0),
+        "slot": ParamSpec(ParamKind.INDEX, required=True),
+    }
+)
 
 #: The complete parameter surface of the normalised command vocabulary. Adding a
 #: command means adding one entry here; no adapter edits a range check.
@@ -166,6 +203,24 @@ PARAM_SCHEMA: Final[Mapping[Command, Mapping[str, ParamSpec]]] = MappingProxyTyp
         Command.PAUSE: MappingProxyType({}),
         Command.RESUME: MappingProxyType({}),
         Command.STOP: MappingProxyType({}),
+        Command.LOAD_FILAMENT: _SLOT_PARAMS,
+        Command.UNLOAD_FILAMENT: _SLOT_PARAMS,
+        Command.SET_FILAMENT: MappingProxyType(
+            {
+                **_SLOT_PARAMS,
+                "material": ParamSpec(
+                    ParamKind.TEXT, required=True, max_length=MAX_LABEL_LENGTH
+                ),
+                "name": ParamSpec(ParamKind.TEXT, max_length=MAX_LABEL_LENGTH),
+                "brand": ParamSpec(ParamKind.TEXT, max_length=MAX_LABEL_LENGTH),
+                "color": ParamSpec(ParamKind.COLOR, required=True),
+                "min_temp": ParamSpec(ParamKind.TEMPERATURE),
+                "max_temp": ParamSpec(ParamKind.TEMPERATURE),
+            }
+        ),
+        Command.SET_AUTO_REFILL: MappingProxyType(
+            {"on": ParamSpec(ParamKind.BOOLEAN, required=True)}
+        ),
     }
 )
 

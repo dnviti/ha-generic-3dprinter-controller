@@ -5,8 +5,22 @@ number inside a fixed envelope, and the printer answers on a topic string derive
 from its own mainboard id rather than on a numeric topic id.
 
 Verified by this project against a live Centauri Carbon on firmware V1.4.49:
-commands 0, 1, 258 and 320 answered, status and attribute frames arrived
+commands 0, 1, 258, 320 and 324 answered, status and attribute frames arrived
 continuously, and the camera streamed multipart JPEG from port 3031.
+
+A CANVAS multi-material unit is read with command 324, the one the printer's own
+page sends, and only while the status says a unit is connected. The page offers
+no command to load, unload or edit a slot, so neither does this adapter: an
+unknown command is exactly what crashes the printer.
+
+The socket is kept the way the printer's own page keeps it, because the printer
+was measured to expect exactly that. A client that sends nothing is closed after
+60 seconds, while one that sends the text ``ping`` every 30 seconds, as the page
+does, stays connected; and the printer pushes its status only when asked, with
+command 0 or with that ``ping``. So this adapter pings, asks for the status on
+every connection instead of trusting what it knew before a power cycle, and
+switches the camera on with command 386 before it reads it, as the page does
+before it shows the camera.
 
 The safety rule this adapter exists to respect. An unrecognised SDCP command code,
 or a recognised code sent with an unexpected payload shape, can crash the
@@ -46,6 +60,7 @@ from ..models import (
     Celsius,
     Fans,
     FileEntry,
+    FilamentSystem,
     Millimetres,
     Percent,
     PrinterSnapshot,
@@ -59,6 +74,7 @@ from ..protocols import (
     ProtocolError,
     UnreachableError,
 )
+from .elegoo_canvas import parse_canvas
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +95,22 @@ ACK_TIMEOUT: Final = 10.0
 #: sends the file list and the attributes in a frame of their own, after the ack.
 PUSH_TIMEOUT: Final = 5.0
 
+#: How often the CANVAS is read while nothing else says it changed. A spool is
+#: swapped by hand, and the printer pushes nothing when that happens.
+CANVAS_INTERVAL: Final = 30.0
+
+#: The printer's own page sends this text this often. Measured on a live printer: a
+#: client that sends nothing is closed after 60 seconds, one that pings stays, and
+#: every ping is answered with a status push.
+HEARTBEAT_INTERVAL: Final = 30.0
+HEARTBEAT_TEXT: Final = "ping"
+#: A socket that has carried nothing for this long is dead, however open it looks.
+#: The printer pushes its attributes every few seconds and answers every ping, so
+#: silence means the printer went away without closing the connection.
+SILENCE_TIMEOUT: Final = 75.0
+#: A status older than this is asked for again before a reading is reported.
+STATUS_MAX_AGE: Final = 20.0
+
 #: The only command codes this adapter will ever put on the wire.
 COMMAND: Final[Mapping[str, int]] = MappingProxyType(
     {
@@ -91,6 +123,8 @@ COMMAND: Final[Mapping[str, int]] = MappingProxyType(
         "file_list": 258,
         "delete_files": 259,
         "history": 320,
+        "canvas": 324,
+        "video": 386,
         "set_params": 403,
     }
 )
@@ -268,6 +302,8 @@ def parse_status(status: Mapping[str, Any]) -> dict[str, Any]:
         "chamber_light": _integer(lights.get("SecondLight")),
         "position": parse_coord(status.get("CurrenCoord")),
         "current_status": status_flags(status.get("CurrentStatus")),
+        # 1 while a CANVAS is attached. Absent on firmware that predates it.
+        "canvas_connected": _integer(status.get("AmsConnectStatus")),
     }
 
 
@@ -322,6 +358,15 @@ class SdcpProtocol(Protocol):
         self._file_list_event = asyncio.Event()
         self._mainboard_id = ""
         self._send_lock = asyncio.Lock()
+        self._canvas: FilamentSystem | None = None
+        self._canvas_at: float | None = None
+        self._canvas_print_status: int | None = None
+        self._heartbeat: asyncio.Task[None] | None = None
+        #: When the printer last sent anything, and when it last sent its status.
+        self._last_frame_at = 0.0
+        self._status_at: float | None = None
+        #: Whether command 386 switched the camera on over the current socket.
+        self._video_enabled = False
 
     # --------------------------------------------------------------- addresses
 
@@ -372,8 +417,8 @@ class SdcpProtocol(Protocol):
 
         self._attributes_event.clear()
         try:
-            # No heartbeat: this adapter reads frames continuously and reconnects on
-            # failure, so a ping timer would add nothing and would outlive teardown.
+            # aiohttp's own ping is off: the printer expects the page's text "ping",
+            # which the heartbeat task below sends.
             self._ws = await self._session.ws_connect(
                 self.ws_url,
                 heartbeat=None,
@@ -396,13 +441,20 @@ class SdcpProtocol(Protocol):
             self._ws = None
             raise UnreachableError(f"timeout contacting {self.config.redacted_url}") from err
 
+        self._last_frame_at = time.monotonic()
+        self._video_enabled = False
         self._reader = asyncio.create_task(self._async_read_frames())
+        self._heartbeat = asyncio.create_task(self._async_heartbeat())
 
         await self._async_request(COMMAND["attributes"])
         with suppress(TimeoutError):
             await asyncio.wait_for(self._attributes_event.wait(), timeout=PUSH_TIMEOUT)
 
         self._mainboard_id = str(self._attributes.get("MainboardID") or "")
+        # Like the printer's own page, ask for the status on every connection. The
+        # printer pushes it only when asked, so a status cached from before a power
+        # cycle would otherwise be reported until somebody opened that page.
+        await self._async_refresh_status()
         _LOGGER.debug(
             "%s: SDCP ready, mainboard %s, firmware %s",
             self.config.name,
@@ -412,40 +464,39 @@ class SdcpProtocol(Protocol):
 
     @property
     def _connected(self) -> bool:
-        """Return ``True`` only while a live socket and a live reader are both held."""
+        """Return ``True`` only while a live socket and a live reader are both held.
+
+        A socket the printer has not spoken on for :data:`SILENCE_TIMEOUT` is not
+        live, however open it looks: a printer that loses power leaves exactly that
+        behind.
+        """
         if self._ws is None or self._ws.closed:
+            return False
+        if self._last_frame_at and time.monotonic() - self._last_frame_at > SILENCE_TIMEOUT:
             return False
         return self._reader is not None and not self._reader.done()
 
     async def _reset_socket(self) -> None:
-        """Drop a dead socket, its reader and any request waiting on it.
+        """Drop the socket, its reader, its heartbeat and any request waiting on it.
 
-        The reader task is not cancelled: it has already finished, or it will finish
-        on its own the moment the socket dies, and cancelling it from here would
-        suppress the ``finally`` that fails the pending requests and clears the
-        reference. Yielding once lets it run that cleanup before a new socket is
-        opened.
+        The old socket is closed, not left behind. The printer holds five client
+        slots, and a socket nobody reads keeps one of them until the printer times
+        it out a minute later. The status it delivered is dropped too, so what was
+        true before a power cycle is never reported as true after it.
         """
-        reader = self._reader
-        if reader is not None and not reader.done():
-            reader.cancel()
-            with suppress(asyncio.CancelledError):
-                await reader
-            return
-
-        ws, self._ws = self._ws, None
-        if ws is not None and not ws.closed:
-            with suppress(aiohttp.ClientError, ConnectionResetError):
-                await ws.close()
-
+        await self._async_close_socket()
         self._fail_pending(UnreachableError("the SDCP socket is not open"))
-        self._reader = None
+        self._status = {}
+        self._status_at = None
 
-        # Give the dead reader a turn so it can clear the reference itself.
-        await asyncio.sleep(0)
+    async def _async_close_socket(self) -> None:
+        """Stop the heartbeat and the reader and close the socket. Idempotent."""
+        heartbeat, self._heartbeat = self._heartbeat, None
+        if heartbeat is not None and not heartbeat.done() and heartbeat is not asyncio.current_task():
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
 
-    async def async_teardown(self) -> None:
-        """Close the socket and stop the reader. Idempotent."""
         reader, self._reader = self._reader, None
         if reader is not None and not reader.done():
             reader.cancel()
@@ -456,6 +507,10 @@ class SdcpProtocol(Protocol):
         if ws is not None and not ws.closed:
             with suppress(aiohttp.ClientError, ConnectionResetError):
                 await ws.close()
+
+    async def async_teardown(self) -> None:
+        """Close the socket and stop the reader and the heartbeat. Idempotent."""
+        await self._async_close_socket()
 
         for future in self._pending.values():
             if not future.done():
@@ -472,6 +527,7 @@ class SdcpProtocol(Protocol):
         try:
             async for message in ws:
                 if message.type is aiohttp.WSMsgType.TEXT:
+                    self._last_frame_at = time.monotonic()
                     self._handle_frame(message.data)
                 elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
@@ -480,6 +536,8 @@ class SdcpProtocol(Protocol):
         except (aiohttp.ClientError, ConnectionResetError) as err:
             _LOGGER.debug("%s: SDCP socket ended: %s", self.config.name, err)
         finally:
+            # A printer that went away comes back with its camera off.
+            self._video_enabled = False
             self._fail_pending(UnreachableError("the SDCP socket closed"))
 
     def _fail_pending(self, error: Exception) -> None:
@@ -507,6 +565,7 @@ class SdcpProtocol(Protocol):
             status = payload.get("Status")
             if isinstance(status, Mapping):
                 self._status = dict(status)
+                self._status_at = time.monotonic()
                 self._status_event.set()
         elif kind == "attributes":
             attributes = payload.get("Attributes")
@@ -543,6 +602,40 @@ class SdcpProtocol(Protocol):
         future = self._pending.pop(request_id, None)
         if future is not None and not future.done():
             future.set_result(data)
+
+    async def _async_heartbeat(self) -> None:
+        """Send ``ping`` as the printer's own page does, and notice a dead socket.
+
+        The printer closes a client that has not pinged for 60 seconds and answers
+        every ping with its status, so this keeps the socket and the status alive
+        together. A socket that has gone silent is closed here, which ends the
+        reader and fails what was waiting on it, so the next read reconnects.
+        """
+        ws = self._ws
+        while ws is not None and not ws.closed:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if ws.closed:
+                break
+            if time.monotonic() - self._last_frame_at > SILENCE_TIMEOUT:
+                _LOGGER.debug("%s: the printer went silent, closing the socket", self.config.name)
+                with suppress(aiohttp.ClientError, ConnectionResetError):
+                    await ws.close()
+                break
+            try:
+                async with self._send_lock:
+                    await ws.send_str(HEARTBEAT_TEXT)
+            except (aiohttp.ClientError, ConnectionResetError) as err:
+                _LOGGER.debug("%s: the heartbeat could not be sent: %s", self.config.name, err)
+                with suppress(aiohttp.ClientError, ConnectionResetError):
+                    await ws.close()
+                break
+
+    async def _async_refresh_status(self) -> None:
+        """Ask for the status, as the page does, and wait briefly for the push."""
+        self._status_event.clear()
+        await self._async_request(COMMAND["status"])
+        with suppress(TimeoutError):
+            await asyncio.wait_for(self._status_event.wait(), timeout=PUSH_TIMEOUT)
 
     # --------------------------------------------------------------- requests
 
@@ -625,11 +718,9 @@ class SdcpProtocol(Protocol):
         if not self._connected:
             await self.async_setup()
 
-        if not self._status:
-            self._status_event.clear()
-            await self._async_request(COMMAND["status"])
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self._status_event.wait(), timeout=PUSH_TIMEOUT)
+        stale = self._status_at is not None and time.monotonic() - self._status_at > STATUS_MAX_AGE
+        if not self._status or stale:
+            await self._async_refresh_status()
 
         parsed = parse_status(self._status)
         flags = parsed["current_status"]
@@ -642,6 +733,7 @@ class SdcpProtocol(Protocol):
 
         # ``lights`` holds the lights that are on, so a known-but-off light is absent.
         light_on = bool(parsed["chamber_light"])
+        filament = await self._async_read_canvas(parsed)
         return PrinterSnapshot(
             protocol=ProtocolId.SDCP_CC1,
             connected=self._connected,
@@ -675,10 +767,40 @@ class SdcpProtocol(Protocol):
             position=parsed["position"],
             lights=frozenset({LightChannel.CHAMBER}) if light_on else frozenset(),
             camera=self._attributes.get("CameraStatus") == 1,
+            filament=filament,
             model=str(self._attributes.get("MachineName") or "") or None,
             firmware=str(self._attributes.get("FirmwareVersion") or "") or None,
             serial=self._mainboard_id or None,
         )
+
+    async def _async_read_canvas(self, parsed: Mapping[str, Any]) -> FilamentSystem | None:
+        """Return the CANVAS, reading it again when it may have changed.
+
+        Only a status that says a unit is connected leads to command 324. A firmware
+        without the field is never sent a command it may not know. The unit is read
+        again after :data:`CANVAS_INTERVAL`, and at once when the print status
+        changes, because starting or ending a job changes the slot in use. A read
+        that fails keeps the last answer rather than blanking the slots.
+        """
+        if Capability.FILAMENT_SLOTS not in self.capabilities or parsed["canvas_connected"] != 1:
+            self._canvas = None
+            self._canvas_at = None
+            return None
+        now = time.monotonic()
+        fresh = self._canvas_at is not None and now - self._canvas_at < CANVAS_INTERVAL
+        if fresh and parsed["print_status"] == self._canvas_print_status:
+            return self._canvas
+        try:
+            response = await self._async_request(COMMAND["canvas"])
+        except UnreachableError:
+            raise
+        except ProtocolError as err:
+            _LOGGER.debug("%s: the CANVAS did not answer: %s", self.config.name, err)
+            return self._canvas
+        self._canvas = parse_canvas(response)
+        self._canvas_at = now
+        self._canvas_print_status = parsed["print_status"]
+        return self._canvas
 
     # --------------------------------------------------------------- commands
 
@@ -824,12 +946,35 @@ class SdcpProtocol(Protocol):
 
     # ----------------------------------------------------------------- camera
 
+    async def _async_enable_video(self) -> None:
+        """Switch the camera stream on, as the printer's own page does before showing it.
+
+        After a power cycle the camera stayed dark until the printer's page had been
+        opened, and the page sends command 386 with ``Enable`` set before it shows
+        the camera. It is sent once per connection, and again after the camera
+        failed. A camera that is already on answers it the same way.
+        """
+        if self._video_enabled:
+            return
+        try:
+            response = await self._async_request(COMMAND["video"], {"Enable": 1})
+        except ProtocolError as err:
+            _LOGGER.debug("%s: the camera was not switched on: %s", self.config.name, err)
+            return
+        ack = _integer((response or {}).get("Ack"))
+        if ack not in (None, 0):
+            _LOGGER.debug("%s: the printer refused to switch the camera on: %s", self.config.name, ack)
+            return
+        self._video_enabled = True
+
     async def async_camera_frame(self) -> bytes:
         """Return one JPEG frame read from the printer's MJPEG stream."""
+        await self._async_enable_video()
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=10)
         try:
             async with self._session.get(self.camera_url, timeout=timeout) as response:
                 if response.status >= 400:
+                    self._video_enabled = False
                     raise UnreachableError(f"the camera answered HTTP {response.status}")
                 buffer = bytearray()
                 async for chunk in response.content.iter_chunked(STREAM_CHUNK):
@@ -840,8 +985,10 @@ class SdcpProtocol(Protocol):
                     if len(buffer) > MAX_FRAME_BYTES:
                         raise UnreachableError("the camera frame exceeded the size cap")
         except aiohttp.ClientError as err:
+            self._video_enabled = False
             raise UnreachableError(f"cannot reach the camera: {err}") from err
         except TimeoutError as err:
+            self._video_enabled = False
             raise UnreachableError("the camera did not deliver a frame") from err
         raise UnreachableError("the camera stream ended before a complete frame arrived")
 
@@ -852,15 +999,21 @@ class SdcpProtocol(Protocol):
         very small pool of connection slots and leaks them on disconnect, so frames
         are fanned out downstream from here rather than per viewer.
         """
+        await self._async_enable_video()
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=15)
-        async with self._session.get(self.camera_url, timeout=timeout) as response:
-            if response.status >= 400:
-                raise UnreachableError(f"the camera answered HTTP {response.status}")
-            buffer = bytearray()
-            async for chunk in response.content.iter_chunked(STREAM_CHUNK):
-                buffer.extend(chunk)
-                for frame in jpeg_frames(buffer):
-                    yield frame
+        try:
+            async with self._session.get(self.camera_url, timeout=timeout) as response:
+                if response.status >= 400:
+                    raise UnreachableError(f"the camera answered HTTP {response.status}")
+                buffer = bytearray()
+                async for chunk in response.content.iter_chunked(STREAM_CHUNK):
+                    buffer.extend(chunk)
+                    for frame in jpeg_frames(buffer):
+                        yield frame
+        except (aiohttp.ClientError, TimeoutError, UnreachableError):
+            # Ask for the camera again next time: the printer may have restarted.
+            self._video_enabled = False
+            raise
 
 
 async def _response_json(response: aiohttp.ClientResponse) -> Mapping[str, Any] | None:
