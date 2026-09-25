@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.2
+
+**Fixed**
+
+* **A long file name pushed the card past its own edge.** The card's main column
+  grew to fit its longest line, so a long name in the file list or of the job in
+  progress widened the camera, the tabs and everything else with it, and they ran
+  under the next card on the dashboard. The column now stays the width of the card.
+* The round buttons (light, power, delete) were squeezed into ovals next to a long
+  name. They keep their shape.
+
+**Added**
+
+* **Text that does not fit is cut with an ellipsis, and shown whole in a popup.**
+  This applies to the printer's name and model line, the job, file names and sizes,
+  the status and temperature tiles, the tabs and the card title. The popup opens
+  when the mouse rests on the text, and on a tap on a phone. It opens only when
+  the text is actually cut. It stays on its text while the card updates, and closes
+  with Escape or when the file list scrolls.
+* Messages, such as the note that starting a print is turned off, still wrap onto
+  more lines rather than being cut. A long word in one, such as a file name, now
+  breaks instead of running out of the card.
+
 ## 0.4.1
 
 **Verified**
