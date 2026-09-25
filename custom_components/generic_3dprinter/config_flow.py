@@ -4,10 +4,15 @@ The user picks a protocol, enters an address, and the flow proves the address
 answers before the entry is created. Discovery is offered as a convenience and is
 never trusted on its own: a probe that finds a product name fills in the form, and
 the user still confirms it. Nothing in this flow sends a command to a printer.
+
+A product line whose generations speak different protocols appears once in the
+protocol menu, and a second step asks which model it is, so the user picks the
+printer they own rather than a wire protocol they have never heard of.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -26,6 +31,7 @@ from .const import (
     CONF_PORT,
     CONF_PROTOCOL,
     CONF_SCAN_INTERVAL,
+    CONF_SERIAL,
     CONF_TLS,
     CONF_UNSAFE_ENABLED,
     CONF_USERNAME,
@@ -37,14 +43,22 @@ from .const import (
     MIN_SCAN_INTERVAL,
     ProtocolId,
 )
-from .discovery import async_discover_host, async_discover_sdcp
+from .discovery import async_discover_cc2, async_discover_host, async_discover_sdcp
 from .protocols import ConfigError, PrinterConfig, parse_config
-from .registry import ADAPTERS, AdapterRegistration, get_registration
+from .registry import (
+    ADAPTERS,
+    FAMILIES,
+    AdapterRegistration,
+    family_members,
+    get_registration,
+    protocol_menu,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_USER = "user"
 STEP_PROTOCOL = "protocol"
+STEP_MODEL = "model"
 STEP_DETAILS = "details"
 STEP_UNSAFE = "unsafe"
 
@@ -65,6 +79,7 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
         """Start an empty flow."""
         self._data: dict[str, Any] = {}
         self._registration: AdapterRegistration | None = None
+        self._family: str | None = None
 
     # ------------------------------------------------------------------ steps
 
@@ -89,7 +104,8 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Probe for a printer and pre-fill the form with what answered."""
-        discovered = await async_discover_sdcp()
+        sdcp, cc2 = await asyncio.gather(async_discover_sdcp(), async_discover_cc2())
+        discovered = sdcp or cc2
         found: dict[str, Any] = {"host": "", "protocol": ""}
         evidence: list[str] = []
         if discovered is not None:
@@ -98,6 +114,8 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
             evidence = discovered.evidence
             if discovered.model:
                 found["name"] = discovered.model
+            if discovered is cc2 and cc2.mainboard_id:
+                found[CONF_SERIAL] = cc2.mainboard_id
         else:
             manual = self._data.get(CONF_HOST)
             if manual:
@@ -105,8 +123,10 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
                 if probe is not None:
                     found["host"] = probe.host
                     found["protocol"] = probe.protocol.value
-                    found["name"] = probe.protocol.value
+                    found["name"] = probe.model or probe.protocol.value
                     evidence = probe.evidence
+                    if probe.protocol is ProtocolId.ELEGOO_CC2 and probe.mainboard_id:
+                        found[CONF_SERIAL] = probe.mainboard_id
 
         if not found["host"]:
             return self.async_show_form(
@@ -123,16 +143,22 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_protocol(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Ask which protocol the printer speaks."""
+        """Ask which protocol the printer speaks, or which product family it is."""
         if user_input is not None:
-            self._data[CONF_PROTOCOL] = user_input[CONF_PROTOCOL]
+            choice = str(user_input[CONF_PROTOCOL])
+            if choice in FAMILIES:
+                self._family = choice
+                members = family_members(choice)
+                if len(members) == 1:
+                    self._data[CONF_PROTOCOL] = members[0].id.value
+                    return await self.async_step_details()
+                return await self.async_step_model()
+            self._data[CONF_PROTOCOL] = choice
             return await self.async_step_details()
 
         options = [
-            selector.SelectOptionDict(value=item.value, label=registration.label)
-            for item, registration in sorted(
-                ADAPTERS.items(), key=lambda pair: pair[1].label
-            )
+            selector.SelectOptionDict(value=value, label=label)
+            for value, label in protocol_menu()
         ]
         return self.async_show_form(
             step_id=STEP_PROTOCOL,
@@ -143,6 +169,37 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
                 }
             ),
+        )
+
+    async def async_step_model(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask which model of the chosen family the printer is."""
+        family = self._family
+        if family is None:
+            return await self.async_step_protocol()
+        members = family_members(family)
+
+        if user_input is not None:
+            self._data[CONF_PROTOCOL] = user_input[CONF_PROTOCOL]
+            return await self.async_step_details()
+
+        options = [
+            selector.SelectOptionDict(
+                value=registration.id.value, label=registration.model or registration.label
+            )
+            for registration in members
+        ]
+        return self.async_show_form(
+            step_id=STEP_MODEL,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PROTOCOL): selector.SelectSelector(
+                        selector.SelectSelectorConfig(options=options)
+                    )
+                }
+            ),
+            description_placeholders={"family": FAMILIES[family]},
         )
 
     async def async_step_details(
@@ -163,6 +220,7 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
             candidate = {**self._data, **user_input}
             try:
                 config = parse_config(candidate)
+                config = await registration.adapter.async_prepare_config(config)
             except ConfigError as err:
                 errors["base"] = "invalid_config"
                 self._data["_error_detail"] = str(err)
@@ -254,6 +312,8 @@ class Generic3DPrinterConfigFlow(ConfigFlow, domain=DOMAIN):
             fields[
                 vol.Optional(CONF_TLS, default=self._data.get(CONF_TLS, False))
             ] = selector.BooleanSelector()
+        if CONF_SERIAL in registration.fields:
+            fields[vol.Optional(CONF_SERIAL, default=self._data.get(CONF_SERIAL) or "")] = str
 
         fields[
             vol.Optional(CONF_VERIFY_SSL, default=self._data.get(CONF_VERIFY_SSL, True))
@@ -341,6 +401,9 @@ class Generic3DPrinterOptionsFlow(OptionsFlow):
                 CONF_VERIFY_SSL, default=current.get(CONF_VERIFY_SSL, True)
             ): selector.BooleanSelector(),
         }
+
+        if CONF_SERIAL in registration.fields:
+            schema[vol.Optional(CONF_SERIAL, default=current.get(CONF_SERIAL) or "")] = str
 
         for key in registration.credentials:
             schema[vol.Optional(key, default=current.get(key, ""))] = str

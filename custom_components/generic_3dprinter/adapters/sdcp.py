@@ -40,6 +40,7 @@ from ..const import (
     ProtocolId,
     UnsafeFeature,
 )
+from ..mjpeg import JPEG_EOI, JPEG_SOI, jpeg_frames  # noqa: F401 - re-exported
 from ..models import (
     Axis,
     Celsius,
@@ -68,8 +69,6 @@ CAMERA_PATH: Final = "/video"
 UPLOAD_PATH: Final = "/uploadFile/upload"
 
 UPLOAD_CHUNK: Final = 1024 * 1024
-JPEG_SOI: Final = b"\xff\xd8"
-JPEG_EOI: Final = b"\xff\xd9"
 MAX_FRAME_BYTES: Final = 8 * 1024 * 1024
 STREAM_CHUNK: Final = 65536
 
@@ -285,30 +284,6 @@ def parse_file_list(payload: Any) -> list[FileEntry]:
             continue
         entries.append(FileEntry(name=name, path=name, size=_integer(item.get("FileSize"))))
     return entries
-
-
-def jpeg_frames(buffer: bytearray, *, first_only: bool = False) -> list[bytes]:
-    """Remove every complete JPEG from the front of ``buffer``.
-
-    The printer's camera emits a full JPEG per multipart part, so a frame is
-    delimited by the start-of-image and end-of-image markers rather than by the
-    part headers, which are not reliable on this build.
-    """
-    frames: list[bytes] = []
-    while True:
-        start = buffer.find(JPEG_SOI)
-        if start < 0:
-            buffer.clear()
-            return frames
-        end = buffer.find(JPEG_EOI, start + len(JPEG_SOI))
-        if end < 0:
-            if start:
-                del buffer[:start]
-            return frames
-        frames.append(bytes(buffer[start : end + len(JPEG_EOI)]))
-        del buffer[: end + len(JPEG_EOI)]
-        if first_only:
-            return frames
 
 
 def _celsius(value: Any) -> Celsius | None:

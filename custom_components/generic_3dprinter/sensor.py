@@ -175,7 +175,7 @@ SENSOR_DESCRIPTIONS: tuple[Generic3DPrinterSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda snapshot: snapshot.chamber.current,
         suggested_display_precision=1,
-        gate=_gate_for(Capability.SET_CHAMBER_TEMP),
+        gate=_gate_for(Capability.SET_CHAMBER_TEMP, Capability.CHAMBER_SENSOR, any_of=True),
     ),
     Generic3DPrinterSensorDescription(
         key="chamber_target_temperature",

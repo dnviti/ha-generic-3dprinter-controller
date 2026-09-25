@@ -106,6 +106,10 @@ class Capability(StrEnum):
     SET_HOTEND_TEMP = "set_hotend_temp"
     SET_BED_TEMP = "set_bed_temp"
     SET_CHAMBER_TEMP = "set_chamber_temp"
+    #: The printer reports a chamber temperature it cannot be told to reach. A
+    #: printer with ``SET_CHAMBER_TEMP`` reports one as well, so this is only
+    #: declared by a protocol whose chamber is a reading and nothing more.
+    CHAMBER_SENSOR = "chamber_sensor"
     SET_FAN_SPEED = "set_fan_speed"
     SET_SPEED = "set_speed"
     SET_FLOW = "set_flow"
@@ -163,6 +167,7 @@ class ProtocolId(StrEnum):
     """Every protocol this integration speaks."""
 
     SDCP_CC1 = "sdcp_cc1"
+    ELEGOO_CC2 = "elegoo_cc2"
     MOONRAKER = "moonraker"
     OCTOPRINT = "octoprint"
     PRUSALINK = "prusalink"

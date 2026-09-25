@@ -28,6 +28,7 @@ _LOGGER = logging.getLogger(__name__)
 #: Every adapter module that ships with the integration.
 ADAPTER_MODULES: Final[tuple[str, ...]] = (
     "sdcp",
+    "elegoo_cc2",
     "moonraker",
     "octoprint",
     "prusalink",
@@ -71,6 +72,34 @@ _UNSAFE_SDCP_START_PRINT: Final = UnsafeFeature(
     evidence="bjan/pycentauri docs/PROTOCOL.md, unknown-Cmd and payload-mismatch crash mode",
 )
 
+_UNSAFE_CC2_START_PRINT: Final = UnsafeFeature(
+    id="cc2_start_print",
+    label="Allow starting a print over the network",
+    reason=(
+        "Starting a print heats and moves the printer with nobody at it, and on a "
+        "Centauri Carbon 2 two parts of the request are easy to get wrong. The "
+        "printer remembers the last auto-levelling choice it was given, so this "
+        "integration always asks for levelling, which adds a few minutes to every "
+        "print. And it lets the printer choose the Canvas tray, because a wrong tray "
+        "mapping is accepted and then printed from the first tray. Enable this only "
+        "if you accept that a print can start while the bed is not clear."
+    ),
+    gates=frozenset({Capability.START_PRINT}),
+    evidence=(
+        "method 1020 and its config object come from Elegoo's elegoo-link SDK; the "
+        "remembered levelling choice and the silent tray fallback were measured by "
+        "danielcherubini/elegoo-homeassistant on firmware 02.01.00.00"
+    ),
+)
+
+#: Menu entries that stand for several protocols, one per printer model. The
+#: config flow shows the family once and then asks which model, so one product
+#: line appears once in the protocol menu however its generations differ on the
+#: wire.
+FAMILIES: Final[Mapping[str, str]] = MappingProxyType(
+    {"elegoo_centauri": "Elegoo Centauri Carbon"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class AdapterRegistration:
@@ -93,6 +122,10 @@ class AdapterRegistration:
     evidence: Mapping[str, str] = field(default_factory=dict)
     #: Whether a discovery probe can identify this protocol from a host alone.
     detectable: bool = True
+    #: The :data:`FAMILIES` entry this protocol is offered under, if any.
+    family: str | None = None
+    #: The model name shown when the user picks within the family.
+    model: str | None = None
 
 
 def _resolve(module: Any, name: str) -> type[Protocol] | None:
@@ -145,6 +178,61 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
                     "and were not sent to hardware by this project"
                 ),
             },
+            family="elegoo_centauri",
+            model="Centauri Carbon",
+        ),
+        ProtocolId.ELEGOO_CC2: AdapterRegistration(
+            id=ProtocolId.ELEGOO_CC2,
+            label="Elegoo MQTT (Centauri Carbon 2)",
+            adapter=_resolve(_ADAPTER_MODULES["elegoo_cc2"], "ElegooCC2Protocol"),  # type: ignore[arg-type]
+            # Absent on purpose: SET_CHAMBER_TEMP, because the set-temperature
+            # method takes only the nozzle and the bed; FILE_DELETE, because the two
+            # sources disagree on its payload and neither was measured; WEB_UI,
+            # because the printer serves no page of its own. HOME and JOG are
+            # refused by the adapter unless the printer reports itself idle.
+            capabilities=frozenset(
+                {
+                    Capability.START_PRINT,
+                    Capability.PAUSE,
+                    Capability.RESUME,
+                    Capability.STOP,
+                    Capability.SET_HOTEND_TEMP,
+                    Capability.SET_BED_TEMP,
+                    Capability.CHAMBER_SENSOR,
+                    Capability.SET_FAN_SPEED,
+                    Capability.SET_SPEED,
+                    Capability.SET_LIGHT,
+                    Capability.HOME,
+                    Capability.JOG,
+                    Capability.FILE_LIST,
+                    Capability.FILE_UPLOAD,
+                    Capability.CAMERA,
+                }
+            ),
+            fields=("port", "camera_port", "serial"),
+            credentials=("access_code",),
+            ports=(1883,),
+            unsafe=(_UNSAFE_CC2_START_PRINT,),
+            evidence={
+                "verified": (
+                    "a live Centauri Carbon 2 (protocol_version 1.0.0) answered the UDP "
+                    "discovery request on port 52700 with its serial, model, lan_status "
+                    "and token_status; its broker on 1883 accepted elegoo/123456 and "
+                    "the subscriptions. In cloud mode the printer answered neither the "
+                    "registration nor methods 1001 and 1002"
+                ),
+                "inferred": (
+                    "registration, heartbeat, methods 1001, 1002, 1020, 1021, 1022 and "
+                    "the upload come from Elegoo's elegoo-link SDK; methods 1023, 1028 "
+                    "to 1031, 1042 and 1044 from community clients measured on firmware "
+                    "02.01.00.00; the 1026 and 1027 payloads are built by the SDK's own "
+                    "request converter, whose method table leaves them commented out, "
+                    "and sent by runnane/elegoo-web. None was answered by hardware for "
+                    "this project, because the test printer was not in LAN-only mode"
+                ),
+            },
+            family="elegoo_centauri",
+            model="Centauri Carbon 2",
         ),
         ProtocolId.MOONRAKER: AdapterRegistration(
             id=ProtocolId.MOONRAKER,
@@ -304,6 +392,26 @@ def _all_registrations() -> dict[ProtocolId, AdapterRegistration]:
 ADAPTERS: Final[Mapping[ProtocolId, AdapterRegistration]] = MappingProxyType(
     _all_registrations()
 )
+
+
+def protocol_menu() -> list[tuple[str, str]]:
+    """Return the protocol menu as ``(value, label)`` pairs, sorted by label.
+
+    A protocol that belongs to a family is offered through the family's single
+    entry, whose value is the family id rather than a protocol id.
+    """
+    entries: dict[str, str] = {}
+    for protocol, registration in ADAPTERS.items():
+        if registration.family in FAMILIES:
+            entries[registration.family] = FAMILIES[registration.family]  # type: ignore[index]
+        else:
+            entries[protocol.value] = registration.label
+    return sorted(entries.items(), key=lambda item: item[1])
+
+
+def family_members(family: str) -> list[AdapterRegistration]:
+    """Return the installed protocols of one family, in registry order."""
+    return [registration for registration in ADAPTERS.values() if registration.family == family]
 
 
 def get_registration(protocol: ProtocolId) -> AdapterRegistration:

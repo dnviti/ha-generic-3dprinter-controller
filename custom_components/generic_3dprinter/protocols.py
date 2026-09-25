@@ -181,6 +181,9 @@ class PrinterConfig:
     scan_interval: int = DEFAULT_SCAN_INTERVAL
     web_url: str | None = None
     camera_port: int | None = None
+    #: The printer's own serial number, for a protocol that addresses a printer by
+    #: it rather than by its network address.
+    serial: str | None = None
     #: Values, never keys. Redacted out of diagnostics.
     credentials: Mapping[str, str] = field(default_factory=dict)
     #: Ids of the :class:`UnsafeFeature` values the user explicitly accepted.
@@ -221,6 +224,7 @@ class PrinterConfig:
             "scan_interval": self.scan_interval,
             "web_url": self.web_url,
             "camera_port": self.camera_port,
+            "serial": self.serial,
             "unsafe_enabled": sorted(self.unsafe_enabled),
         }
         if include_secrets:
@@ -265,6 +269,12 @@ def parse_config(
     if web_url:
         web_url = validate_url(web_url, label="web ui url")
 
+    serial = str(data.get("serial") or "").strip() or None
+    if serial is not None and (len(serial) > 64 or not serial.isalnum()):
+        # The serial becomes part of an MQTT topic, where "/", "+" and "#" have
+        # meaning, so only the letters and digits a real serial is made of pass.
+        raise ConfigError("serial number must be letters and digits only")
+
     credentials: dict[str, str] = {}
     for key in CREDENTIAL_KEYS:
         value = data.get(key)
@@ -296,6 +306,7 @@ def parse_config(
         ),
         web_url=web_url,
         camera_port=camera_port,
+        serial=serial,
         credentials=credentials,
         unsafe_enabled=unsafe_enabled,
     )
@@ -337,6 +348,16 @@ class Protocol(ABC):
     def unsafe_features(self) -> tuple[UnsafeFeature, ...]:
         """Return the hazards this protocol declares."""
         return self._unsafe
+
+    @classmethod
+    async def async_prepare_config(cls, config: PrinterConfig) -> PrinterConfig:
+        """Check a configuration before its entry is created, filling in what it can.
+
+        Called by the config flow, never at runtime. It may probe the printer but
+        must not send it a command. Raises :class:`ConfigError` with a message the
+        user can act on. The default accepts the configuration unchanged.
+        """
+        return config
 
     @abstractmethod
     async def async_setup(self) -> None:

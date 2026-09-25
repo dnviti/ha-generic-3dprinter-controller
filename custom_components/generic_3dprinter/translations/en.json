@@ -10,9 +10,16 @@
       },
       "protocol": {
         "title": "Which protocol does the printer speak?",
-        "description": "Pick the printer's control protocol, not its brand. If you are unsure, choose Web page only and the integration will proxy the printer's own page.",
+        "description": "Pick the printer's control protocol, or its product line where one is listed. If you are unsure, choose Web page only and the integration will proxy the printer's own page.",
         "data": {
           "protocol": "Protocol"
+        }
+      },
+      "model": {
+        "title": "Which model is it?",
+        "description": "The {family} models speak different protocols. Pick the one you own.",
+        "data": {
+          "protocol": "Model"
         }
       },
       "details": {
@@ -24,6 +31,7 @@
           "port": "Port",
           "web_url": "Web UI address",
           "camera_port": "Camera port",
+          "serial": "Serial number (found automatically when left empty)",
           "tls": "Use TLS",
           "verify_ssl": "Verify the TLS certificate",
           "scan_interval": "Poll interval",
@@ -37,7 +45,8 @@
         "title": "Commands that can damage the printer",
         "description": "{hazards}\n\nLeave these off unless you accept the risk. You can change them later in the integration options.",
         "data": {
-          "unsafe_sdcp_start_print": "Allow starting a print over the network"
+          "unsafe_sdcp_start_print": "Allow starting a print over the network",
+          "unsafe_cc2_start_print": "Allow starting a print over the network"
         }
       }
     },
@@ -63,11 +72,13 @@
           "port": "Port",
           "scan_interval": "Poll interval",
           "verify_ssl": "Verify the TLS certificate",
+          "serial": "Serial number",
           "api_key": "API key",
           "username": "Username",
           "password": "Password",
           "access_code": "Access code",
-          "unsafe_sdcp_start_print": "Allow starting a print over the network"
+          "unsafe_sdcp_start_print": "Allow starting a print over the network",
+          "unsafe_cc2_start_print": "Allow starting a print over the network"
         }
       }
     },
