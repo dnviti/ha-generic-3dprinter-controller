@@ -48,6 +48,12 @@ const HOT_NOZZLE = 50;
 const TEMPERATURE_MAX = 350;
 const TEMPERATURE_NUDGE = 5;
 
+/* How long the mouse rests on a text cut short before the whole text is shown. */
+const TIP_DELAY_MS = 250;
+
+/* How long a text shown by a tap stays up, since a finger never leaves it. */
+const TIP_TOUCH_MS = 4000;
+
 const STATE_COLORS = {
   idle: "var(--state-inactive-color, #9e9e9e)",
   preparing: "var(--warning-color, #ff9800)",
@@ -204,6 +210,149 @@ const baseName = (path) => String(path || "").split("/").pop();
 const editing = (input) =>
   input.dataset.dirty === "1" || input.getRootNode().activeElement === input;
 
+/**
+ * The popup that shows a text cut short by an ellipsis in full.
+ *
+ * Every element with the `trunc` class takes part, and only while its text is
+ * actually cut off. It opens when the mouse rests on the text, and on a tap, since
+ * a touch screen has no hover. The text is whole in the DOM either way, so a screen
+ * reader reads all of it. The popup lives on the card rather than beside the text,
+ * so the scrolling file list cannot clip it. The file list and the status tiles are
+ * rebuilt on every reading, which takes the text out from under the popup, so after
+ * a redraw it looks up what now sits where its text was and stays on that.
+ */
+class TextTip {
+  constructor(root, container) {
+    this.root = root;
+    this.container = container;
+    this.node = el("div", "tip");
+    this.node.setAttribute("role", "tooltip");
+    this.node.hidden = true;
+    container.appendChild(this.node);
+    this.anchor = null;
+    this.pending = null;
+    this.center = null;
+    this.timer = null;
+    this.pointer = "mouse";
+
+    root.addEventListener("pointerdown", (event) => {
+      this.pointer = event.pointerType || "mouse";
+    });
+    root.addEventListener("pointerover", (event) => {
+      if (event.pointerType === "touch") return;
+      const target = this._target(event.target);
+      if (target && (target === this.anchor || target === this.pending)) return;
+      this.hide();
+      if (target) this._later(target, TIP_DELAY_MS);
+    });
+    root.addEventListener("pointerout", (event) => {
+      if (event.pointerType === "touch") return;
+      if (!event.relatedTarget || !root.contains(event.relatedTarget)) this.hide();
+    });
+    root.addEventListener("click", (event) => {
+      if (this.pointer !== "touch") return;
+      const target = this._target(event.target);
+      if (!target || target === this.anchor) {
+        this.hide();
+        return;
+      }
+      this.show(target);
+      if (this.anchor) this._later(null, TIP_TOUCH_MS);
+    });
+    root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") this.hide();
+    });
+    // Scroll events do not bubble, so the file list's is caught on the way down.
+    root.addEventListener("scroll", () => this.hide(), true);
+  }
+
+  _target(node) {
+    if (!node || typeof node.closest !== "function") return null;
+    const target = node.closest(".trunc");
+    return target && this.root.contains(target) ? target : null;
+  }
+
+  /** Show `target` after `delay`, or hide when `target` is null. */
+  _later(target, delay) {
+    this._cancel();
+    this.pending = target;
+    this.timer = window.setTimeout(() => {
+      this.timer = null;
+      this.pending = null;
+      if (target) this._paint(target);
+      else this.hide();
+    }, delay);
+  }
+
+  _cancel() {
+    window.clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = null;
+  }
+
+  show(target) {
+    this._cancel();
+    this._paint(target);
+  }
+
+  hide() {
+    this._cancel();
+    this.anchor = null;
+    this.center = null;
+    this.node.hidden = true;
+  }
+
+  /** Follow the text after a redraw: the same element, or what replaced it. */
+  refresh() {
+    if (!this.anchor) return;
+    if (this.anchor.isConnected) {
+      this._paint(this.anchor);
+      return;
+    }
+    const found =
+      this.center && typeof this.root.elementFromPoint === "function"
+        ? this.root.elementFromPoint(this.center.x, this.center.y)
+        : null;
+    const next = this._target(found);
+    if (next) this._paint(next);
+    else this.hide();
+  }
+
+  /** Show the text of `target`, unless all of it is already on screen. */
+  _paint(target) {
+    const text = target.textContent.trim();
+    if (!target.isConnected || !text || target.scrollWidth <= target.clientWidth) {
+      this.hide();
+      return;
+    }
+    this.anchor = target;
+    this.node.textContent = text;
+    this.node.hidden = false;
+    this._place();
+  }
+
+  /** Put the popup under the text, or above it when the card ends first. */
+  _place() {
+    const gap = 6;
+    const margin = 8;
+    const card = this.container;
+    this.node.style.left = "0px";
+    this.node.style.top = "0px";
+    const anchor = this.anchor.getBoundingClientRect();
+    const box = card.getBoundingClientRect();
+    const tip = this.node.getBoundingClientRect();
+    const originX = box.left + card.clientLeft;
+    const originY = box.top + card.clientTop;
+    const left = Math.max(margin, Math.min(anchor.left - originX - margin, card.clientWidth - tip.width - margin));
+    let top = anchor.bottom - originY + gap;
+    const above = anchor.top - originY - gap - tip.height;
+    if (top + tip.height > card.clientHeight - margin && above >= margin) top = above;
+    this.node.style.left = `${left}px`;
+    this.node.style.top = `${top}px`;
+    this.center = { x: anchor.left + anchor.width / 2, y: anchor.top + anchor.height / 2 };
+  }
+}
+
 // ------------------------------------------------------------------- views
 
 /**
@@ -242,8 +391,8 @@ class PrinterView {
     this.dot = el("span", "dot");
     header.appendChild(this.dot);
     const names = el("div", "names");
-    this.nameEl = el("div", "name");
-    this.subtitleEl = el("div", "subtitle");
+    this.nameEl = el("div", "name trunc");
+    this.subtitleEl = el("div", "subtitle trunc");
     names.append(this.nameEl, this.subtitleEl);
     header.appendChild(names);
     this.stateEl = el("div", "state");
@@ -276,7 +425,7 @@ class PrinterView {
         ["controls", "Controls"],
         ["files", "Files"],
       ]) {
-        const tab = el("button", "tab", label);
+        const tab = el("button", "tab trunc", label);
         tab.type = "button";
         tab.dataset.tab = key;
         tab.addEventListener("click", () => this.selectTab(key));
@@ -878,15 +1027,14 @@ class PrinterView {
       if (value === null || value === undefined || this.poweredOff) continue;
       const cell = el("div", "stat");
       cell.dataset.stat = key;
-      cell.append(el("span", "stat-label", label), el("span", "stat-value", value));
+      cell.append(el("span", "stat-label trunc", label), el("span", "stat-value trunc", value));
       this.statsEl.appendChild(cell);
     }
     this.statsEl.hidden = this.statsEl.childElementCount === 0;
 
     this.jobEl.replaceChildren();
     if (snapshot.filename && !this.poweredOff) {
-      this.jobEl.append(icon("file", 16), el("span", "job-name", baseName(snapshot.filename)));
-      this.jobEl.title = snapshot.filename;
+      this.jobEl.append(icon("file", 16), el("span", "job-name trunc", baseName(snapshot.filename)));
     }
     this.jobEl.hidden = this.jobEl.childElementCount === 0;
 
@@ -901,10 +1049,10 @@ class PrinterView {
         if (!visible || !temps) continue;
         if (asNumber(temps.current) === null && asNumber(temps.target) === null) continue;
         const cell = el("div", "temp");
-        cell.appendChild(el("span", "temp-label", label));
+        cell.appendChild(el("span", "temp-label trunc", label));
         const target = asNumber(temps.target);
         const current = formatTemperature(temps.current);
-        cell.appendChild(el("span", "temp-value", target ? `${current} → ${target.toFixed(0)} °C` : current));
+        cell.appendChild(el("span", "temp-value trunc", target ? `${current} → ${target.toFixed(0)} °C` : current));
         if (target) cell.classList.add("heating");
         this.tempsEl.appendChild(cell);
       }
@@ -1097,11 +1245,11 @@ class PrinterView {
       const row = el("div", "file");
       row.dataset.file = file.name;
       const info = el("div", "file-info");
-      info.appendChild(el("div", "file-name", baseName(file.name)));
+      info.appendChild(el("div", "file-name trunc", baseName(file.name)));
       const meta = [formatBytes(file.size), file.modified ? new Date(file.modified).toLocaleString() : ""]
         .filter(Boolean)
         .join(" · ");
-      if (meta) info.appendChild(el("div", "file-meta", meta));
+      if (meta) info.appendChild(el("div", "file-meta trunc", meta));
       row.append(icon("file", 18), info);
       if (caps.includes("start_print")) {
         const print = button("icon-btn file-print", "Print", "play", "start_print");
@@ -1117,6 +1265,8 @@ class PrinterView {
       }
       this.fileList.appendChild(row);
     }
+    // The list is also redrawn outside a reading, when files arrive or an upload ends.
+    this.card.refreshTip();
   }
 
   _updateFooter() {
@@ -1208,6 +1358,7 @@ class Generic3DPrinterCard extends HTMLElement {
 
   disconnectedCallback() {
     this._stop();
+    if (this._tip) this._tip.hide();
     for (const view of this._views.values()) view._suspendCamera();
   }
 
@@ -1395,14 +1546,25 @@ class Generic3DPrinterCard extends HTMLElement {
 
   _sync() {
     if (!this.shadowRoot) return;
+    this._draw();
+    this.refreshTip();
+  }
+
+  /** Keep the popup of a text cut short on its text after the DOM under it changed. */
+  refreshTip() {
+    if (this._tip) this._tip.refresh();
+  }
+
+  _draw() {
     if (!this._container) {
       this.shadowRoot.replaceChildren();
       this.shadowRoot.appendChild(this._style());
       this._container = el("ha-card", "card");
-      this._titleEl = el("div", "card-title");
+      this._titleEl = el("div", "card-title trunc");
       this._list = el("div", "printers");
       this._container.append(this._titleEl, this._list);
       this.shadowRoot.appendChild(this._container);
+      this._tip = new TextTip(this.shadowRoot, this._container);
     }
     this._titleEl.textContent = this._config.title || "";
     this._titleEl.hidden = !this._config.title;
@@ -1459,8 +1621,20 @@ class Generic3DPrinterCard extends HTMLElement {
         color: var(--primary-text-color);
         font-family: var(--ha-font-family-body, var(--paper-font-body1_-_font-family, sans-serif));
         box-sizing: border-box;
+        position: relative;
       }
       [hidden] { display: none !important; }
+      /* One line, cut with an ellipsis; the popup shows the rest. */
+      .trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+      .tip {
+        position: absolute; z-index: 10; max-width: calc(100% - 16px); box-sizing: border-box;
+        padding: 6px 10px; border-radius: 8px; font-size: 0.82rem; line-height: 1.35;
+        /* The theme's text and page colours swapped, so it stands out in either theme. */
+        background: var(--primary-text-color, #212121);
+        color: var(--primary-background-color, var(--card-background-color, #fff));
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); pointer-events: none;
+        white-space: normal; overflow-wrap: anywhere;
+      }
       button { font: inherit; }
       .card-title { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; }
       .printer + .printer { border-top: 1px solid var(--divider-color, #e0e0e0); margin-top: 16px; padding-top: 16px; }
@@ -1468,13 +1642,13 @@ class Generic3DPrinterCard extends HTMLElement {
       .printer-header { display: flex; align-items: center; gap: 10px; }
       .dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; }
       .names { flex: 1 1 auto; min-width: 0; }
-      .name { font-weight: 600; font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .name { font-weight: 600; font-size: 1.05rem; }
       .subtitle { font-size: 0.78rem; color: var(--secondary-text-color); }
-      .state { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+      .state { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
 
       .icon-btn {
         display: inline-flex; align-items: center; justify-content: center;
-        width: 38px; height: 38px; border-radius: 50%;
+        width: 38px; height: 38px; border-radius: 50%; flex: 0 0 auto;
         border: 1px solid var(--divider-color, #e0e0e0);
         background: transparent; color: var(--secondary-text-color); cursor: pointer; padding: 0;
         transition: background 0.2s, color 0.2s, border-color 0.2s;
@@ -1486,12 +1660,17 @@ class Generic3DPrinterCard extends HTMLElement {
       .power-toggle.on { color: var(--success-color, #43a047); border-color: var(--success-color, #43a047); background: rgba(67, 160, 71, 0.12); }
       .icon-btn.danger { color: var(--error-color, #f44336); }
 
+      /* Messages wrap rather than cut, and a long file name or address in one breaks. */
+      .warning, .error-line, .hint, .files-status, .empty, .empty-panel, .camera-error { overflow-wrap: anywhere; }
       .warning { margin-top: 10px; font-size: 0.85rem; color: var(--error-color, #f44336); }
       .warning.off { color: var(--secondary-text-color); }
       .errors { margin-top: 6px; }
       .error-line { font-size: 0.8rem; color: var(--warning-color, #ff9800); }
 
-      .body { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 12px; }
+      /* minmax(0, 1fr), not 1fr: a 1fr column grows to its longest line, a file name
+       * included, and takes the whole card past its edge. */
+      .body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-top: 12px; }
+      .body > * { min-width: 0; }
       @container (min-width: 720px) {
         .body.with-camera { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); align-items: start; }
       }
@@ -1516,18 +1695,18 @@ class Generic3DPrinterCard extends HTMLElement {
       .progress-track { height: 10px; border-radius: 5px; background: var(--divider-color, #e0e0e0); overflow: hidden; }
       .progress-fill { height: 100%; transition: width 0.4s ease; border-radius: 5px; }
       .progress-label { font-size: 1.6rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
-      .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 10px; margin-top: 10px; }
-      .stat { display: flex; flex-direction: column; }
+      .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 10px; margin-top: 10px; }
+      .stat { display: flex; flex-direction: column; min-width: 0; }
       .stat-label, .temp-label, .section-title, .steps-label {
         font-size: 0.7rem; text-transform: uppercase; color: var(--secondary-text-color); letter-spacing: 0.05em;
       }
       .stat-value { font-variant-numeric: tabular-nums; font-weight: 600; }
       .job { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 0.88rem; color: var(--secondary-text-color); }
-      .job-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--primary-text-color); }
+      .job-name { color: var(--primary-text-color); }
       .temps { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 8px; margin-top: 12px; }
       .temp { display: flex; flex-direction: column; padding: 8px 10px; border-radius: 10px; background: var(--secondary-background-color, #f5f5f5); min-width: 0; }
       .temp.heating { box-shadow: inset 3px 0 0 var(--warning-color, #ff9800); }
-      .temp-value { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; font-size: 0.95rem; }
+      .temp-value { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 0.95rem; }
       .fans-readout, .reported-fans { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; font-size: 0.8rem; color: var(--secondary-text-color); }
       .fan-reading { display: inline-flex; align-items: center; gap: 4px; }
       .fan-reading.spinning svg { animation: spin 1.2s linear infinite; color: var(--primary-color); }
@@ -1619,7 +1798,6 @@ class Generic3DPrinterCard extends HTMLElement {
       .file { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--divider-color, #eee); }
       .file > svg { color: var(--secondary-text-color); flex: 0 0 auto; }
       .file-info { flex: 1 1 auto; min-width: 0; }
-      .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .file-meta { font-size: 0.75rem; color: var(--secondary-text-color); }
       .file .icon-btn { width: 34px; height: 34px; }
       .file-print { color: var(--primary-color); }

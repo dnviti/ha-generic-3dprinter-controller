@@ -899,6 +899,89 @@ test("a file is uploaded through the authenticated endpoint", async () => {
   assert.equal(uploads[0].init.body.get("file").name, "part.gcode");
 });
 
+// ---------------------------------------------------------------- long text
+
+const LONG_NAME = "ECC_0.4_Crimson Wing Dragon_1789719946_generate_eSUN PLA+ _0.2_10h4m.gcode";
+
+/** jsdom has no layout, so a text is made to overflow by giving it a scroll width. */
+function overflowLongText(window) {
+  Object.defineProperty(window.HTMLElement.prototype, "scrollWidth", {
+    configurable: true,
+    get() {
+      return this.textContent.length > 20 ? 900 : 0;
+    },
+  });
+}
+
+async function mountWithLongFile() {
+  const mountedCard = await mountCard({
+    printers: [{ entry_id: "entry1", name: "CC2" }],
+    descriptions: { entry1: idleCc2() },
+    files: [...FILES, { name: LONG_NAME, path: LONG_NAME, size: 66100000, modified: null }],
+  });
+  overflowLongText(mountedCard.window);
+  await openTab(mountedCard.card, "files");
+  await tick();
+  return mountedCard;
+}
+
+const fileName = (card, text) => all(card, ".file-name").find((node) => node.textContent === text);
+
+const pointer = (window, type, node, pointerType = "mouse") => {
+  const event = new window.PointerEvent(type, { bubbles: true, composed: true, pointerType });
+  node.dispatchEvent(event);
+};
+
+test("a file name too long for the card is cut, and shown whole on hover", async () => {
+  const { card, window } = await mountWithLongFile();
+  const tip = card.shadowRoot.querySelector(".tip");
+  const long = fileName(card, LONG_NAME);
+  assert.ok(long.classList.contains("trunc"), "expected the file name to be cut to one line");
+
+  pointer(window, "pointerover", long);
+  assert.equal(tip.hidden, true, "the popup waits for the mouse to rest");
+  await tick(300);
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, LONG_NAME);
+  assert.equal(tip.getAttribute("role"), "tooltip");
+
+  // A name that fits gets no popup, and moving onto it closes the last one.
+  pointer(window, "pointerover", fileName(card, "cube.gcode"));
+  assert.equal(tip.hidden, true);
+  await tick(300);
+  assert.equal(tip.hidden, true);
+});
+
+test("the popup stays on its text when a reading redraws the file list", async () => {
+  const { card, window } = await mountWithLongFile();
+  const tip = card.shadowRoot.querySelector(".tip");
+  const before = fileName(card, LONG_NAME);
+  pointer(window, "pointerover", before);
+  await tick(300);
+  assert.equal(tip.hidden, false);
+
+  // The rebuilt row sits where the old one was.
+  card.shadowRoot.elementFromPoint = () => fileName(card, LONG_NAME);
+  await card.refreshOne("entry1");
+  assert.equal(before.isConnected, false, "expected the reading to rebuild the row");
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, LONG_NAME);
+});
+
+test("on a touch screen a tap shows the whole text and a second tap hides it", async () => {
+  const { card, window } = await mountWithLongFile();
+  const tip = card.shadowRoot.querySelector(".tip");
+  const long = fileName(card, LONG_NAME);
+  pointer(window, "pointerover", long, "touch");
+  pointer(window, "pointerdown", long, "touch");
+  long.click();
+  assert.equal(tip.hidden, false, "a tap shows the popup at once");
+  assert.equal(tip.textContent, LONG_NAME);
+  pointer(window, "pointerdown", long, "touch");
+  long.click();
+  assert.equal(tip.hidden, true);
+});
+
 test("a printer without file capabilities has no files tab", async () => {
   const { card } = await mountCard({
     printers: [{ entry_id: "entry1", name: "Printer" }],
